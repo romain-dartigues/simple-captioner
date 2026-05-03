@@ -246,6 +246,7 @@ def generate_caption(
 
     content_type = "video" if is_video else "image"
 
+    t_start = monotonic()
     media_data = media_path if is_video else Image.open(media_path).convert("RGB")
 
     content_block = {"type": content_type, content_type: media_data}
@@ -295,9 +296,11 @@ def generate_caption(
         padding=True,
         return_tensors="pt",
     ).to("cuda", non_blocking=True)
+    t_prep_end = monotonic()
 
     with torch.inference_mode():
         generated_ids = model.generate(**inputs, max_new_tokens=max_tokens)
+    t_gen_end = monotonic()
 
     generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
     caption = processor.batch_decode(
@@ -308,6 +311,16 @@ def generate_caption(
 
     if qwen35 and "<think>" in caption:
         caption = r_caption.sub("", caption)
+    t_dec_end = monotonic()
+
+    logger.debug(
+        "caption timings (s): prep=%.3f gen=%.3f dec=%.3f total=%.3f path=%s",
+        t_prep_end - t_start,
+        t_gen_end - t_prep_end,
+        t_dec_end - t_gen_end,
+        t_dec_end - t_start,
+        media_path,
+    )
 
     return caption.strip()
 
