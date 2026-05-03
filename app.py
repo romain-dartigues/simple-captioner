@@ -445,7 +445,7 @@ def process_folder(
 
             if skip_existing and os.path.exists(txt_path):
                 progress = int(((idx + 1) / total_media) * 100)
-                elapsed = monotonic() - start_time
+                elapsed = int(monotonic() - start_time)
                 elapsed_str = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
                 skipped_media += 1
 
