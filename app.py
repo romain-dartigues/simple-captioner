@@ -305,9 +305,7 @@ def _build_messages(
     if not is_video:
         content_block.update(_resolution_kwargs(resolution_mode))
     user_text = _augment_prompt(prompt, summary_mode, one_sentence_mode)
-    messages: list[dict[str, Any]] = [
-        {"role": "user", "content": [content_block, {"type": "text", "text": user_text}]}
-    ]
+    messages: list[dict[str, Any]] = [{"role": "user", "content": [content_block, {"type": "text", "text": user_text}]}]
     if is_qwen35_model(current_model_id):
         messages.append({"role": "assistant", "content": "<think>\n\n</think>\n\n"})
     return messages
@@ -621,8 +619,12 @@ def _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefe
             for media_path in paths:
                 yield (
                     f"⚠️ Error processing {media_path}: {err}",
-                    None, None, "Error in captioning.",
-                    0, elapsed_str, *start_process(),
+                    None,
+                    None,
+                    "Error in captioning.",
+                    0,
+                    elapsed_str,
+                    *start_process(),
                 )
             continue
 
@@ -635,8 +637,12 @@ def _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefe
                 failed_media += 1
                 yield (
                     f"⚠️ Error writing {media_path}: {e}",
-                    None, None, "Error in captioning.",
-                    0, elapsed_str, *start_process(),
+                    None,
+                    None,
+                    "Error in captioning.",
+                    0,
+                    elapsed_str,
+                    *start_process(),
                 )
                 continue
 
@@ -648,6 +654,7 @@ def _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefe
             last_caption = caption
             last_name_md = name_md
             processed_media += 1
+            logger.info(f"🖼️ Processed {idx + 1}/{total_media}: {rel_path} in {elapsed_str}")
             yield (
                 f"🖼️ Processing {idx + 1}/{total_media}: {rel_path}",
                 media_to_show,
@@ -691,9 +698,18 @@ def process_folder(
         "starting folder processing: model=%s quant=%s folder=%s skip_existing=%s "
         "max_tokens=%s summary=%s one_sentence=%s retain_preview=%s resolution=%s "
         "batch_size=%s prefetch_workers=%s should_abort=%s",
-        current_model_id, current_quant, folder_path, skip_existing,
-        max_tokens, summary_mode, one_sentence_mode, retain_preview, resolution_mode,
-        batch_size, prefetch_workers, should_abort,
+        current_model_id,
+        current_quant,
+        folder_path,
+        skip_existing,
+        max_tokens,
+        summary_mode,
+        one_sentence_mode,
+        retain_preview,
+        resolution_mode,
+        batch_size,
+        prefetch_workers,
+        should_abort,
     )
 
     if not folder_path.strip():
@@ -714,7 +730,12 @@ def process_folder(
     if not total_media:
         yield (
             "📂 No media found in the folder or subfolders.",
-            None, None, "No media to process.", 0, "", *finish_process(),
+            None,
+            None,
+            "No media to process.",
+            0,
+            "",
+            *finish_process(),
         )
         return
 
@@ -764,6 +785,7 @@ def process_folder(
 basicConfig(
     level="INFO",
 )
+logger.setLevel("DEBUG")
 
 with gradio.Blocks() as iface:  # type: ignore
     gradio.Markdown("# Simple Captioner")
@@ -813,10 +835,7 @@ with gradio.Blocks() as iface:  # type: ignore
         model_id = custom_id.strip() if sel == "Custom..." and custom_id and custom_id.strip() else sel
         name, device, vram, dtype, cfg = load_selected_model(model_id, quant, attn)
         suggested_bs = suggest_batch_size()
-        status = (
-            f"✅ Loaded '{model_id}' with {quant} quantization ({attn}). "
-            f"Suggested batch size: {suggested_bs}."
-        )
+        status = f"✅ Loaded '{model_id}' with {quant} quantization ({attn}). Suggested batch size: {suggested_bs}."
         logger.debug("status: %s", status)
         return status, name, device, vram, dtype, cfg, gradio.update(value=suggested_bs)
 
@@ -834,7 +853,7 @@ with gradio.Blocks() as iface:  # type: ignore
         )
         ui_e["prompt_input"] = gradio.Textbox(label="Custom Prompt", value=DEFAULT_PROMPT)
 
-    ui_e["skip_existing_checkbox"] = gradio.Checkbox(label="Skip already captioned media (.txt exists)", value=False)
+    ui_e["skip_existing_checkbox"] = gradio.Checkbox(label="Skip already captioned media (.txt exists)", value=True)
 
     with gradio.Row():
         gradio.Markdown("### Prompt Controls")

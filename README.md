@@ -155,7 +155,8 @@ For better performance, [you can try to install decord from source](https://gith
 
 ## Usage Notes
 
-```
+```sh
+HF_HUB_OFFLINE=1 \
 GRADIO_SERVER_NAME="0.0.0.0" uv run python app.py
 ```
 
