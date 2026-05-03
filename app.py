@@ -125,6 +125,14 @@ def load_selected_model(model_id: str, quant_choice: str, attn_impl: str = DEFAU
 
     processor = _AP.from_pretrained(model_id)
 
+    # Left padding is required for correct batched causal-LM generation:
+    # all sequences must share the same right edge so model.generate
+    # continues each from its true last token. Right padding would make
+    # the model resume from pad tokens for the shorter sequences.
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not None and getattr(tokenizer, "padding_side", None) is not None:
+        tokenizer.padding_side = "left"
+
     current_model_id = model_id
     current_quant = quant_choice
     return get_model_info()
@@ -269,6 +277,48 @@ def _build_messages(
     return messages
 
 
+def preprocess_batch(
+    media_paths: list[str],
+    prompt: str,
+    summary_mode: bool = False,
+    one_sentence_mode: bool = False,
+    resolution_mode: str = "auto",
+):
+    """Build a BatchFeature with batch dim len(media_paths) on CPU.
+    Concatenates per-sample images/videos in positional order — the
+    processor matches the i-th `<|image_pad|>` text token to the i-th
+    image across the flat list, so order matters."""
+    assert processor is not None, "Processor must be loaded before preprocessing."
+    if not media_paths:
+        raise ValueError("preprocess_batch requires at least one media path")
+    qwen35 = is_qwen35_model(current_model_id)
+    texts: list[str] = []
+    images_acc: list[Any] = []
+    videos_acc: list[Any] = []
+    for path in media_paths:
+        messages = _build_messages(path, prompt, summary_mode, one_sentence_mode, resolution_mode)
+        texts.append(
+            processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=not qwen35,
+                continue_final_message=qwen35,
+            )
+        )
+        imgs, vids = process_vision_info(messages)
+        if imgs:
+            images_acc.extend(imgs)
+        if vids:
+            videos_acc.extend(vids)
+    return processor(
+        text=texts,
+        images=images_acc or None,
+        videos=videos_acc or None,
+        padding=True,
+        return_tensors="pt",
+    )
+
+
 def preprocess_one(
     media_path: str,
     prompt: str,
@@ -276,31 +326,16 @@ def preprocess_one(
     one_sentence_mode: bool = False,
     resolution_mode: str = "auto",
 ):
-    """Build a single-sample BatchFeature on CPU. Touches only the processor,
-    not the model — safe to call from worker threads while the GPU is busy."""
-    assert processor is not None, "Processor must be loaded before preprocessing."
-    messages = _build_messages(media_path, prompt, summary_mode, one_sentence_mode, resolution_mode)
-    qwen35 = is_qwen35_model(current_model_id)
-    text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=not qwen35,
-        continue_final_message=qwen35,
-    )
-    vision_info = process_vision_info(messages)
-    return processor(
-        text=[text],
-        images=vision_info[0],
-        videos=vision_info[1],
-        padding=True,
-        return_tensors="pt",
-    )
+    """Single-sample wrapper around preprocess_batch. Safe to call from
+    worker threads while the GPU is busy (touches only the processor)."""
+    return preprocess_batch([media_path], prompt, summary_mode, one_sentence_mode, resolution_mode)
 
 
 def run_generate(inputs, max_tokens: int):
-    """Move CPU BatchFeature to GPU in place, run model.generate, return
-    (generated_ids, input_ids) on CPU. Mutates `inputs` (the .to() call
-    rebinds its tensors to GPU); caller should not reuse the CPU view."""
+    """Move a CPU BatchFeature (any batch dim) to GPU in place, run
+    model.generate, return (generated_ids, input_ids) on CPU. Mutates
+    `inputs` (the .to() call rebinds its tensors to GPU); caller should
+    not reuse the CPU view."""
     assert model is not None, "Model must be loaded before generating."
     inputs_gpu = inputs.to("cuda", non_blocking=True)
     with torch.inference_mode():
@@ -308,18 +343,25 @@ def run_generate(inputs, max_tokens: int):
     return generated_ids.cpu(), inputs_gpu["input_ids"].cpu()
 
 
-def decode_one(generated_ids, input_ids) -> str:
-    """Decode a batch-dim-1 generated_ids tensor into a single caption string."""
+def decode_batch(generated_ids, input_ids) -> list[str]:
+    """Decode a [B, L_out] generated_ids tensor into a list of B caption
+    strings, trimming each by the corresponding input length and
+    stripping Qwen3.5 think tags when present."""
     assert processor is not None, "Processor must be loaded before decoding."
     trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(input_ids, generated_ids)]
-    caption = processor.batch_decode(
+    captions = processor.batch_decode(
         trimmed,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
-    )[0]
-    if is_qwen35_model(current_model_id) and "<think>" in caption:
-        caption = r_caption.sub("", caption)
-    return caption.strip()
+    )
+    if is_qwen35_model(current_model_id):
+        captions = [r_caption.sub("", c) if "<think>" in c else c for c in captions]
+    return [c.strip() for c in captions]
+
+
+def decode_one(generated_ids, input_ids) -> str:
+    """Single-sample wrapper around decode_batch."""
+    return decode_batch(generated_ids, input_ids)[0]
 
 
 def generate_caption(
