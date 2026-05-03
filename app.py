@@ -285,7 +285,7 @@ def generate_caption(
         videos=vision_info[1],
         padding=True,
         return_tensors="pt",
-    ).to("cuda")
+    ).to("cuda", non_blocking=True)
 
     with torch.inference_mode():
         generated_ids = model.generate(**inputs, max_new_tokens=max_tokens)
