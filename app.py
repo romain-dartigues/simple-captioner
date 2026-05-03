@@ -1,7 +1,9 @@
 # stdlib
 import os
 import re
+import threading
 from logging import basicConfig, getLogger
+from queue import Empty, Full, Queue
 from time import monotonic
 from typing import Any
 
@@ -29,6 +31,7 @@ DEFAULT_PROMPT = (
 DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 DEFAULT_QUANT = "8-bit"  # "None" | "8-bit" | "4-bit"
 DEFAULT_ATTN = "eager" if os.name == "nt" else "flash_attention_2"
+PREFETCH_QUEUE_SIZE = 4  # how many preprocessed samples may sit ahead of the GPU
 
 
 AVAILABLE_MODELS = [
@@ -366,6 +369,194 @@ def build_final_prompt(user_prompt, summary, one_sentence):
     return " ".join(parts)
 
 
+def _format_elapsed_str(start_time: float) -> str:
+    elapsed = int(monotonic() - start_time)
+    return f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+
+
+def _txt_path_for(media_path: str) -> str:
+    return os.path.join(
+        os.path.dirname(media_path),
+        os.path.splitext(os.path.basename(media_path))[0] + ".txt",
+    )
+
+
+def _prefetch_producer(
+    media_files: list[str],
+    prompt: str,
+    summary_mode: bool,
+    one_sentence_mode: bool,
+    resolution_mode: str,
+    skip_existing: bool,
+    out_queue: Queue,
+    cancel: threading.Event,
+) -> None:
+    """Run preprocess_one ahead of the GPU consumer. Items are tagged tuples:
+        ("ready", idx, media_path, BatchFeature)  — preprocessed, GPU-ready
+        ("skip",  idx, media_path, None)          — already captioned
+        ("error", idx, media_path, exception)     — preprocess failed
+    Pushes a single `None` sentinel on exit so the consumer knows the stream
+    is over (whether cleanly, on abort, or after an exception)."""
+    try:
+        for idx, media_path in enumerate(media_files):
+            if should_abort or cancel.is_set():
+                return
+            if skip_existing and os.path.exists(_txt_path_for(media_path)):
+                item: tuple = ("skip", idx, media_path, None)
+            else:
+                try:
+                    inputs = preprocess_one(
+                        media_path,
+                        prompt,
+                        summary_mode,
+                        one_sentence_mode,
+                        resolution_mode,
+                    )
+                    item = ("ready", idx, media_path, inputs)
+                except Exception as e:
+                    logger.exception("Preprocess failed for %s", media_path)
+                    item = ("error", idx, media_path, e)
+            while not cancel.is_set():
+                try:
+                    out_queue.put(item, timeout=0.25)
+                    break
+                except Full:
+                    continue
+            else:
+                return
+    finally:
+        try:
+            out_queue.put(None, timeout=0.25)
+        except Full:
+            pass
+
+
+def _process_ready_item(idx, total_media, media_path, inputs, folder_path, max_tokens):
+    """Run GPU + decode + write for one prefetched-ready sample. Returns
+    (status, media_to_show, media_name_markdown, caption, progress, elapsed_marker)
+    where elapsed_marker is `None` so the caller can stamp the wall-clock."""
+    t_gen_start = monotonic()
+    generated_ids, input_ids = run_generate(inputs, max_tokens)
+    t_gen_end = monotonic()
+    caption = decode_one(generated_ids, input_ids)
+    t_dec_end = monotonic()
+    logger.debug(
+        "caption timings (s): gen=%.3f dec=%.3f path=%s",
+        t_gen_end - t_gen_start,
+        t_dec_end - t_gen_end,
+        media_path,
+    )
+    media_to_show = Image.open(media_path) if is_image_file(media_path) else None
+    with open(_txt_path_for(media_path), "w", encoding="utf-8") as f:
+        f.write(caption)
+    rel_path = os.path.relpath(media_path, folder_path)
+    return (
+        f"🖼️ Processing {idx + 1}/{total_media}: {rel_path}",
+        media_to_show,
+        f"**File:** `{rel_path}`",
+        caption,
+        int(((idx + 1) / total_media) * 100),
+    )
+
+
+def _build_abort_yield():
+    status_index = control_keys.index("status_output")
+    abort_index = control_keys.index("abort_button")
+    control_updates = enable_controls_dict()
+    control_updates[status_index] = gradio.update(value="⛔ Aborted by user.")
+    control_updates[abort_index] = gradio.update(interactive=False)
+    return ("⛔ Aborted by user.", None, None, "Aborted.", 0, "", *control_updates)
+
+
+def _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefetch_queue, start_time):
+    """Consumer side of the prefetch pipeline. Yields Gradio update tuples.
+    Reads `should_abort` (and resets it on consumption) so the abort
+    button works mid-loop. Emits the final summary on clean completion;
+    returns early after the abort yield otherwise."""
+    global should_abort
+    processed_media = 0
+    skipped_media = 0
+    failed_media = 0
+    last_media_to_show = None
+    last_caption = ""
+    last_media_name_markdown = ""
+    elapsed_str = ""
+
+    while True:
+        if should_abort:
+            should_abort = False
+            yield _build_abort_yield()
+            return
+
+        try:
+            item = prefetch_queue.get(timeout=0.25)
+        except Empty:
+            continue
+        if item is None:
+            break
+
+        kind, idx, media_path, payload = item
+        rel_path = os.path.relpath(media_path, folder_path)
+
+        if kind == "skip":
+            skipped_media += 1
+            elapsed_str = _format_elapsed_str(start_time)
+            yield (
+                f"⏭️ Skipped {idx + 1}/{total_media}: {rel_path} (already captioned)",
+                last_media_to_show if retain_preview else None,
+                last_media_name_markdown if retain_preview else None,
+                last_caption if retain_preview else "Skipped (already captioned)",
+                int(((idx + 1) / total_media) * 100),
+                elapsed_str,
+                *start_process(),
+            )
+            continue
+
+        if kind == "error":
+            failed_media += 1
+            logger.error("Failed processing file: %s: %s", media_path, payload)
+            yield (
+                f"⚠️ Error processing {media_path}: {payload}",
+                None, None, "Error in captioning.",
+                0, elapsed_str, *start_process(),
+            )
+            continue
+
+        try:
+            status, media_to_show, name_md, caption, progress = _process_ready_item(
+                idx, total_media, media_path, payload, folder_path, max_tokens,
+            )
+        except Exception as e:
+            failed_media += 1
+            logger.exception("Generation failed for %s", media_path)
+            yield (
+                f"⚠️ Error processing {media_path}: {e}",
+                None, None, "Error in captioning.",
+                0, elapsed_str, *start_process(),
+            )
+            continue
+
+        elapsed_str = _format_elapsed_str(start_time)
+        last_media_to_show = media_to_show
+        last_caption = caption
+        last_media_name_markdown = name_md
+        processed_media += 1
+        yield (status, media_to_show, name_md, caption, progress, elapsed_str, *start_process())
+
+    logger.info("processing complete: %r %.3f", processed_media, monotonic() - start_time)
+    yield (
+        "✅ Processing complete!"
+        f"processed {processed_media} media in {elapsed_str}, skipped {skipped_media} media."
+        f"Failed to process {failed_media} media (inaccessible, unknown or broken file)",
+        last_media_to_show,
+        last_media_name_markdown,
+        last_caption,
+        None,
+        None,
+        *finish_process(),
+    )
+
+
 def process_folder(
     folder_path,
     prompt,
@@ -376,186 +567,71 @@ def process_folder(
     retain_preview,
     resolution_mode,
 ):
-
-    global should_abort, current_model_id, current_quant
-
-    processed_media = 0
-    skipped_media = 0
-    failed_media = 0
-    last_media_to_show = None
-    last_caption = ""
-    last_media_name_markdown = ""
-    elapsed_str = ""
-
-    logger.debug("starting folder processing...:")
-    logger.debug("\tusing model: %s", current_model_id)
-    logger.debug("\tmodel quantization: %s", current_quant)
-    logger.debug("\tfolder_path: %s", folder_path)
-    logger.debug("\tprompt: %s", prompt)
-    logger.debug("\tskip_existing: %s", skip_existing)
-    logger.debug("\tmax_tokens: %s", max_tokens)
-    logger.debug("\tsummary_mode: %s", summary_mode)
-    logger.debug("\tone_sentence_mode: %s", one_sentence_mode)
-    logger.debug("\tretain_preview: %s", retain_preview)
-    logger.debug("\tresolution_mode: %s", resolution_mode)
-    logger.debug("\tshould_abort: %s", should_abort)
+    logger.debug(
+        "starting folder processing: model=%s quant=%s folder=%s skip_existing=%s "
+        "max_tokens=%s summary=%s one_sentence=%s retain_preview=%s resolution=%s should_abort=%s",
+        current_model_id, current_quant, folder_path, skip_existing,
+        max_tokens, summary_mode, one_sentence_mode, retain_preview, resolution_mode, should_abort,
+    )
 
     if not folder_path.strip():
-        yield (
-            "⚠️ Please enter a valid folder path.",
-            None,
-            None,
-            "No media to process.",
-            0,
-            "",
-            *finish_process(),
-        )
+        yield ("⚠️ Please enter a valid folder path.", None, None, "No media to process.", 0, "", *finish_process())
         return
 
     if not os.path.exists(folder_path):
-        yield (
-            f"❌ Folder not found: {folder_path}",
-            None,
-            None,
-            "No media to process.",
-            0,
-            "",
-            *finish_process(),
-        )
+        yield (f"❌ Folder not found: {folder_path}", None, None, "No media to process.", 0, "", *finish_process())
         return
 
-    media_files = []
-    for root, _, files in os.walk(folder_path):
-        for file in files:
-            if is_image_file(file) or is_video_file(file):
-                media_files.append(os.path.join(root, file))
-
+    media_files = [
+        os.path.join(root, file)
+        for root, _, files in os.walk(folder_path)
+        for file in files
+        if is_image_file(file) or is_video_file(file)
+    ]
     total_media = len(media_files)
-
     if not total_media:
         yield (
             "📂 No media found in the folder or subfolders.",
-            None,
-            None,
-            "No media to process.",
-            0,
-            "",
-            *finish_process(),
+            None, None, "No media to process.", 0, "", *finish_process(),
         )
         return
 
     start_time = monotonic()
 
-    for idx, media_path in enumerate(media_files):
-        if should_abort:
-            should_abort = False
-            status_index = control_keys.index("status_output")
-            abort_index = control_keys.index("abort_button")
-            control_updates = enable_controls_dict()
-            control_updates[status_index] = gradio.update(value="⛔ Aborted by user.")
-            control_updates[abort_index] = gradio.update(interactive=False)
-
-            yield (
-                "⛔ Aborted by user.",
-                None,
-                None,
-                "Aborted.",
-                0,
-                "",
-                *control_updates,
-            )
-            return
-        try:
-            txt_path = os.path.join(
-                os.path.dirname(media_path), os.path.splitext(os.path.basename(media_path))[0] + ".txt"
-            )
-
-            rel_path = os.path.relpath(media_path, folder_path)
-            media_name_markdown = f"**File:** `{rel_path}`"
-
-            if skip_existing and os.path.exists(txt_path):
-                progress = int(((idx + 1) / total_media) * 100)
-                elapsed = int(monotonic() - start_time)
-                elapsed_str = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
-                skipped_media += 1
-
-                control_updates = start_process()
-                yield (
-                    f"⏭️ Skipped {idx + 1}/{total_media}: {rel_path} (already captioned)",
-                    last_media_to_show if retain_preview else None,
-                    last_media_name_markdown if retain_preview else None,
-                    last_caption if retain_preview else "Skipped (already captioned)",
-                    progress,
-                    elapsed_str,
-                    *control_updates,
-                )
-                continue
-
-            caption = generate_caption(
-                media_path,
-                prompt,
-                max_tokens,
-                summary_mode,
-                one_sentence_mode,
-                resolution_mode,
-            )
-
-            # Only generate previews for images
-            if is_image_file(media_path):
-                media_to_show = Image.open(media_path)
-            else:
-                media_to_show = None
-
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(caption)
-
-            progress = int(((idx + 1) / total_media) * 100)
-            elapsed = int(monotonic() - start_time)
-            elapsed_str = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
-
-            last_media_to_show = media_to_show
-            last_caption = caption
-            last_media_name_markdown = media_name_markdown
-            processed_media += 1
-            control_updates = start_process()
-            yield (
-                f"🖼️ Processing {idx + 1}/{total_media}: {rel_path}",
-                media_to_show,
-                media_name_markdown,
-                caption,
-                progress,
-                elapsed_str,
-                *control_updates,
-            )
-
-        except Exception as e:
-            failed_media += 1
-            logger.error("Failed processing file: %s: %s", media_path, e)
-            control_updates = start_process()
-            yield (
-                f"⚠️ Error processing {media_path}: {str(e)}",
-                None,
-                None,
-                "Error in captioning.",
-                0,
-                elapsed_str,
-                *control_updates,
-            )
-
-    logger.info("processing complete: %r %.3f", processed_media, monotonic() - start_time)
-
-    control_updates = finish_process()
-    yield (
-        "✅ Processing complete!"
-        f"processed {processed_media} media in {elapsed_str}, skipped {skipped_media} media."
-        f"Failed to process {failed_media} media (inaccessible, unknown or broken file)",
-        last_media_to_show,
-        last_media_name_markdown,
-        last_caption,
-        None,
-        None,
-        *control_updates,
+    # Prefetch CPU-side preprocessing on a worker thread so it overlaps
+    # with model.generate on the GPU. See _prefetch_producer for the
+    # queue item taxonomy.
+    prefetch_queue: Queue = Queue(maxsize=PREFETCH_QUEUE_SIZE)
+    cancel = threading.Event()
+    producer_thread = threading.Thread(
+        target=_prefetch_producer,
+        name="caption-prefetch",
+        daemon=True,
+        kwargs={
+            "media_files": media_files,
+            "prompt": prompt,
+            "summary_mode": summary_mode,
+            "one_sentence_mode": one_sentence_mode,
+            "resolution_mode": resolution_mode,
+            "skip_existing": skip_existing,
+            "out_queue": prefetch_queue,
+            "cancel": cancel,
+        },
     )
+    producer_thread.start()
+
+    try:
+        yield from _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefetch_queue, start_time)
+    finally:
+        cancel.set()
+        # Drain so the producer's blocked .put(...) can return and the
+        # thread exits before we leave the generator.
+        try:
+            while True:
+                prefetch_queue.get_nowait()
+        except Empty:
+            pass
+        producer_thread.join(timeout=2.0)
 
 
 basicConfig(
