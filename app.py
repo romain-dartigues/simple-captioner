@@ -52,11 +52,20 @@ should_abort = False
 ui_e = {}
 
 
+def preferred_compute_dtype():
+    """bf16 on Ampere+ (sm_80+), fp16 elsewhere. bf16 has the same range
+    as fp32 so it avoids the activation overflows fp16 can hit during
+    matmul accumulation, at no speed cost on supported hardware."""
+    if torch.cuda.is_available() and torch.cuda.get_device_capability(0) >= (8, 0):
+        return torch.bfloat16
+    return torch.float16
+
+
 def build_bnb_config(quant_choice: str):
     if quant_choice == "8-bit":
         return BitsAndBytesConfig(load_in_8bit=True)
     if quant_choice == "4-bit":
-        return BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+        return BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=preferred_compute_dtype())
     return None
 
 
