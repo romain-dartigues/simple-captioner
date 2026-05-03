@@ -222,6 +222,103 @@ def get_model_info():
 logger.debug("CUDA availability: %s", torch.cuda.is_available())
 
 
+def _augment_prompt(prompt: str, summary_mode: bool, one_sentence_mode: bool) -> str:
+    if summary_mode and one_sentence_mode:
+        return prompt + " Give a one-sentence summary of the scene."
+    if summary_mode:
+        return prompt + " Give a short summary of the scene."
+    if one_sentence_mode:
+        return prompt + " Describe this image in one sentence."
+    return prompt
+
+
+def _resolution_kwargs(resolution_mode: str) -> dict[str, int]:
+    if resolution_mode == "auto":
+        return {"min_pixels": 256 * 28 * 28, "max_pixels": 896 * 28 * 28}
+    if resolution_mode == "auto_high":
+        return {"min_pixels": 256 * 28 * 28, "max_pixels": 1280 * 28 * 28}
+    if resolution_mode == "fast":
+        return {"resized_height": 392, "resized_width": 392}
+    if resolution_mode == "high":
+        return {"resized_height": 728, "resized_width": 728}
+    return {}
+
+
+def _build_messages(
+    media_path: str,
+    prompt: str,
+    summary_mode: bool,
+    one_sentence_mode: bool,
+    resolution_mode: str,
+) -> list[dict[str, Any]]:
+    is_video = is_video_file(media_path)
+    content_type = "video" if is_video else "image"
+    media_data = media_path if is_video else Image.open(media_path).convert("RGB")
+    content_block: dict[str, Any] = {"type": content_type, content_type: media_data}
+    if not is_video:
+        content_block.update(_resolution_kwargs(resolution_mode))
+    user_text = _augment_prompt(prompt, summary_mode, one_sentence_mode)
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": [content_block, {"type": "text", "text": user_text}]}
+    ]
+    if is_qwen35_model(current_model_id):
+        messages.append({"role": "assistant", "content": "<think>\n\n</think>\n\n"})
+    return messages
+
+
+def preprocess_one(
+    media_path: str,
+    prompt: str,
+    summary_mode: bool = False,
+    one_sentence_mode: bool = False,
+    resolution_mode: str = "auto",
+):
+    """Build a single-sample BatchFeature on CPU. Touches only the processor,
+    not the model — safe to call from worker threads while the GPU is busy."""
+    assert processor is not None, "Processor must be loaded before preprocessing."
+    messages = _build_messages(media_path, prompt, summary_mode, one_sentence_mode, resolution_mode)
+    qwen35 = is_qwen35_model(current_model_id)
+    text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=not qwen35,
+        continue_final_message=qwen35,
+    )
+    vision_info = process_vision_info(messages)
+    return processor(
+        text=[text],
+        images=vision_info[0],
+        videos=vision_info[1],
+        padding=True,
+        return_tensors="pt",
+    )
+
+
+def run_generate(inputs, max_tokens: int):
+    """Move CPU BatchFeature to GPU in place, run model.generate, return
+    (generated_ids, input_ids) on CPU. Mutates `inputs` (the .to() call
+    rebinds its tensors to GPU); caller should not reuse the CPU view."""
+    assert model is not None, "Model must be loaded before generating."
+    inputs_gpu = inputs.to("cuda", non_blocking=True)
+    with torch.inference_mode():
+        generated_ids = model.generate(**inputs_gpu, max_new_tokens=max_tokens)
+    return generated_ids.cpu(), inputs_gpu["input_ids"].cpu()
+
+
+def decode_one(generated_ids, input_ids) -> str:
+    """Decode a batch-dim-1 generated_ids tensor into a single caption string."""
+    assert processor is not None, "Processor must be loaded before decoding."
+    trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(input_ids, generated_ids)]
+    caption = processor.batch_decode(
+        trimmed,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )[0]
+    if is_qwen35_model(current_model_id) and "<think>" in caption:
+        caption = r_caption.sub("", caption)
+    return caption.strip()
+
+
 def generate_caption(
     media_path,
     prompt,
@@ -230,87 +327,14 @@ def generate_caption(
     one_sentence_mode=False,
     resolution_mode="auto",
 ):
-    global processor, model
-    assert model is not None, "Model must be loaded before generating captions."
-    assert processor is not None, "Processor must be loaded before generating captions."
-    # Edit custom prompts here if you want
-    if summary_mode and one_sentence_mode:
-        prompt += " Give a one-sentence summary of the scene."
-    elif summary_mode:
-        prompt += " Give a short summary of the scene."
-    elif one_sentence_mode:
-        prompt += " Describe this image in one sentence."
-
-    ext = os.path.splitext(media_path)[-1].lower()
-    is_video = ext in VIDEO_EXTENSIONS
-
-    content_type = "video" if is_video else "image"
-
+    """Single-sample orchestrator preserved for back-compat with callers
+    that don't yet use the prefetched/batched pipeline."""
     t_start = monotonic()
-    media_data = media_path if is_video else Image.open(media_path).convert("RGB")
-
-    content_block = {"type": content_type, content_type: media_data}
-
-    if is_video:
-        ...
-    elif resolution_mode == "auto":
-        content_block["min_pixels"] = 256 * 28 * 28
-        content_block["max_pixels"] = 896 * 28 * 28
-    elif resolution_mode == "auto_high":
-        content_block["min_pixels"] = 256 * 28 * 28
-        content_block["max_pixels"] = 1280 * 28 * 28
-    elif resolution_mode == "fast":
-        content_block["resized_height"] = 392
-        content_block["resized_width"] = 392
-    elif resolution_mode == "high":
-        content_block["resized_height"] = 728
-        content_block["resized_width"] = 728
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                content_block,
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
-
-    qwen35 = is_qwen35_model(current_model_id)
-    if qwen35:
-        messages.append({"role": "assistant", "content": "<think>\n\n</think>\n\n"})
-
-    text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=not qwen35,
-        continue_final_message=qwen35,
-    )
-
-    vision_info = process_vision_info(messages)
-
-    inputs = processor(
-        text=[text],
-        images=vision_info[0],
-        videos=vision_info[1],
-        padding=True,
-        return_tensors="pt",
-    ).to("cuda", non_blocking=True)
+    inputs = preprocess_one(media_path, prompt, summary_mode, one_sentence_mode, resolution_mode)
     t_prep_end = monotonic()
-
-    with torch.inference_mode():
-        generated_ids = model.generate(**inputs, max_new_tokens=max_tokens)
+    generated_ids, input_ids = run_generate(inputs, max_tokens)
     t_gen_end = monotonic()
-
-    generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
-    caption = processor.batch_decode(
-        generated_ids_trimmed,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )[0]
-
-    if qwen35 and "<think>" in caption:
-        caption = r_caption.sub("", caption)
+    caption = decode_one(generated_ids, input_ids)
     t_dec_end = monotonic()
 
     logger.debug(
@@ -322,7 +346,7 @@ def generate_caption(
         media_path,
     )
 
-    return caption.strip()
+    return caption
 
 
 def is_image_file(filename):
