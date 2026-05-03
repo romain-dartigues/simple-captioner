@@ -23,7 +23,34 @@ There is no test suite.
 
 ### Module-level mutable state
 
-`model`, `processor`, `current_model_id`, `current_quant`, `should_abort`, and `ui_e` are module globals mutated by both UI callbacks and the inference generator. `unload_model()` / `load_selected_model()` rebind them; `generate_caption()` and `process_folder()` read them. Anything that touches model lifecycle must go through `load_selected_model()` so the fallback / cache-clear logic stays consistent. The model is **not** loaded at import — it loads lazily when the user clicks "Load / Reload Model" (or implicitly via UI start).
+`model`, `processor`, `current_model_id`, `current_quant`, `should_abort`, and `ui_e` are module globals mutated by both UI callbacks and the inference generator. `unload_model()` / `load_selected_model()` rebind them; the inference helpers (`preprocess_batch`, `run_generate`, `decode_batch`) read them. Anything that touches model lifecycle must go through `load_selected_model()` so the fallback / cache-clear / left-padding configuration stays consistent. The model is **not** loaded at import — it loads lazily when the user clicks "Load / Reload Model" (or implicitly via UI start).
+
+### Inference decomposition: preprocess / run / decode
+
+The captioning code is split into pure stages so the prefetcher and batched generation can compose them:
+
+- `preprocess_batch(paths, ...)` — builds messages + runs the HF processor on CPU. Returns a `BatchFeature` on CPU. **Safe to call from worker threads** (touches only `processor`, not `model`).
+- `run_generate(inputs, max_tokens)` — moves a CPU `BatchFeature` to GPU **in place** (`.to("cuda", non_blocking=True)` rebinds tensors), runs `model.generate`, returns `(generated_ids, input_ids)` on CPU. Single-threaded — only the GPU consumer thread calls this.
+- `decode_batch(generated_ids, input_ids)` — `batch_decode` + Qwen3.5 `<think>…</think>` strip via the module-top `r_caption` regex.
+
+`preprocess_one` / `decode_one` / `generate_caption` are thin single-sample wrappers preserved for back-compat; the active path is the batched pipeline below.
+
+### Pipeline: dispatcher → ThreadPoolExecutor → consumer
+
+`process_folder` is the Gradio handler; the pipeline lives in three pieces:
+
+1. **`_prefetch_dispatcher` (thread)** — walks `media_files` in order, groups runs of non-skipped files into batches of up to `batch_size`, and submits each batch as a `Future` to a `ThreadPoolExecutor` of `prefetch_workers` threads. Skip detection happens inline (no executor work). Pushes ordered tagged items onto a bounded `Queue`:
+   - `("skip",  idx,     path,  None)`
+   - `("batch", indices, paths, Future[BatchFeature])`
+   - `None` end-of-stream sentinel
+2. **Executor pool** — preprocessing workers run `preprocess_batch` in parallel; the dispatcher's submit is non-blocking, queue back-pressure throttles work to in-flight ≈ `queue_size + workers`.
+3. **`_captioning_loop` (consumer, the Gradio generator's body)** — pulls items from the queue in submission order, awaits the Future, runs one `model.generate` per batch, decodes N captions, writes the `.txt` files, and yields one progress update **per sample within the batch** (so progress bar is still per-sample granular even with `batch_size > 1`).
+
+Cleanup on abort/finish (`finally` in `process_folder`): set the `cancel` event, drain the queue (unblocks dispatcher's `put`), `executor.shutdown(wait=False, cancel_futures=True)` cancels queued-but-unstarted preprocess tasks while running ones finish naturally, then `dispatcher.join(timeout=2.0)`.
+
+### Left padding is required for batch generation
+
+`load_selected_model` sets `processor.tokenizer.padding_side = "left"` after instantiating the processor. Causal-LM batch generation requires all sequences to share the same right edge so `model.generate` resumes each from its true last token. With right padding the shorter sequences would resume from a pad token. This was harmless when `batch_size` was hardcoded to 1; it's load-bearing now.
 
 ### Model class dispatch
 
@@ -37,11 +64,15 @@ When adding a new model family, extend this dispatch *and* `is_qwen35_model()` i
 
 ### Qwen3.5 thinking-mode handling
 
-For Qwen3.5 models, `generate_caption()` appends a pre-seeded `{"role": "assistant", "content": "<think>\n\n</think>\n\n"}` message and uses `continue_final_message=True` instead of `add_generation_prompt`. Any `<think>…</think>` block that leaks into the output is stripped with `r_caption` (compiled at module top). VL models don't take this branch.
+For Qwen3.5 models, `_build_messages()` appends a pre-seeded `{"role": "assistant", "content": "<think>\n\n</think>\n\n"}` message and `preprocess_batch` uses `continue_final_message=True` instead of `add_generation_prompt`. Any `<think>…</think>` block that leaks into the output is stripped in `decode_batch` via `r_caption`. VL models don't take this branch.
 
 ### Flash-attention fallback
 
 `load_selected_model()` tries `flash_attention_2` first and silently retries with `eager` on any exception. `DEFAULT_ATTN` is `eager` on Windows (`os.name == "nt"`) and `flash_attention_2` elsewhere because flash-attn is unreliable on Windows. Don't tighten the `except Exception` — the underlying failures vary by torch/flash-attn version combo.
+
+### Compute dtype on Ampere+
+
+`preferred_compute_dtype()` returns `bfloat16` on devices with compute capability ≥ 8.0 (Ampere+, including the RTX 3060) and `float16` otherwise. It's used as the 4-bit BnB compute dtype; bf16 has fp32's exponent range so it avoids activation overflows at no speed cost on supported hardware.
 
 ### `control_keys` and the generator yield contract
 
@@ -55,15 +86,19 @@ Forgetting step 2 causes silent UI drift (wrong components get enabled/disabled)
 
 ### Resolution mode → processor kwargs
 
-`generate_caption()` injects `min_pixels`/`max_pixels` or `resized_height`/`resized_width` directly into the message `content_block` based on `resolution_mode`. The top-level `PRESETS` dict is currently unused — the actual values are hardcoded in the if/elif chain. If you change one, change both or delete `PRESETS`.
+`_resolution_kwargs()` returns the `min_pixels`/`max_pixels` or `resized_height`/`resized_width` dict for a given mode; `_build_messages` injects it into the message content block (only for images — videos take the empty dict).
 
 ### Abort flow
 
-`should_abort` is checked at the top of each loop iteration in `process_folder()` and reset to `False` on consumption. The abort button has `queue=False` so it bypasses Gradio's queue and flips the flag immediately even while a generation is in-flight (the in-flight `model.generate()` call still runs to completion — abort takes effect on the *next* iteration).
+`should_abort` is checked at the top of each `_captioning_loop` iteration **and** at the top of each `_prefetch_dispatcher` iteration, then reset to `False` on consumption by the consumer. The abort button has `queue=False` so it bypasses Gradio's queue and flips the flag immediately even while a generation is in-flight; the in-flight `model.generate()` call still runs to completion — abort takes effect on the *next* batch. The producer-side `cancel` `threading.Event` is a separate signal used only for thread cleanup in the `finally` block.
+
+### Batch size suggestion
+
+`suggest_batch_size()` runs after `load_selected_model` and writes a starting batch size into the slider via `gradio.update`. It buckets free post-load VRAM (≥12 GB → 8, ≥8 → 4, ≥4 → 2, else 1). Deliberately conservative because `max_tokens` and image resolution aren't known yet.
 
 ### Output convention
 
-For each input file `foo.jpg`, the caption is written as `foo.txt` next to it. `skip_existing` checks for that `.txt` before invoking the model. Subfolders are walked recursively via `os.walk`.
+For each input file `foo.jpg`, the caption is written as `foo.txt` next to it (via `_txt_path_for`). `skip_existing` checks for that `.txt` before invoking the model. Subfolders are walked recursively via `os.walk`.
 
 ## Style
 
