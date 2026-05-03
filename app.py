@@ -56,7 +56,12 @@ AVAILABLE_MODELS = [
     "Qwen/Qwen3-VL-8B-Instruct",
     "Qwen/Qwen2.5-VL-3B-Instruct",
     "Qwen/Qwen2.5-VL-7B-Instruct",
-    "Salesforce/blip-image-captioning-base",
+    # Fastest and lightest. Good for rough captions, OCR, dense regions, and prepasses; weaker for rich uncensored natural-language captions.
+    "microsoft/Florence-2-large",
+    # this is the drop-in alternative of: concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf
+    # - Llama-Joycaption-Beta-One-Hf-Llava-Q4_K.gguf
+    # - llama-joycaption-beta-one-llava-mmproj-model-f16.gguf
+    "heavlav/llama-joycaption-beta-one-hf-llava-4bit",
     "Custom...",
 ]
 
