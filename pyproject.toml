@@ -1,0 +1,58 @@
+[build-backend]
+requires = ["uv_build~=0.11.8"]
+
+[project]
+name = "simple-captioner"
+version = "0.0.1"
+dependencies = [
+	"gradio>=6.10.0",
+	"Pillow>=11.2.1",
+	"qwen_vl_utils>=0.0.11",
+	"transformers>=5.4.0",
+	"accelerate>=0.26.0",
+	"bitsandbytes>=0.46.1",
+	"hf_xet>=1.1.10",
+#####
+	"torch",
+	"torchvision",
+]
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+# Unfortunately it require compilation
+flash2 = [
+	"flash-attn>=2.7.4.post1",
+]
+# https://pypi.org/project/flash-attn-4/ is for hopper and blackwell
+flash4 = [
+	"flash-attn-4[cu13]",
+]
+
+[tool.ruff]
+line-length = 120
+show-fixes = true
+
+[tool.ruff.lint]
+select = ["C", "E", "F", "I", "W"]
+
+[tool.uv]
+prerelease = "allow"
+build-constraint-dependencies = [
+	"packaging",
+	"pip",
+	"setuptools==80.10.2",
+]
+
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

@@ -154,6 +154,11 @@ This will fall back to using torchvision for video loading if decord does not wo
 For better performance, [you can try to install decord from source](https://github.com/dmlc/decord)
 
 ## Usage Notes
+
+```
+GRADIO_SERVER_NAME="0.0.0.0" uv run python app.py
+```
+
 - Place your images in a folder (recursively scanned, subfolders are supported.)
 - Text files with the same name (e.g. image1.jpg → image1.txt) are created alongside the images.
 - Use the “Skip already captioned” checkbox to avoid reprocessing.
