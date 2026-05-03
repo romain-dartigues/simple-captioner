@@ -20,7 +20,7 @@ requires-python = ">=3.10"
 [project.optional-dependencies]
 # Unfortunately it require compilation
 flash2 = [
-	"flash-attn>=2.7.4.post1",
+	"flash-attn>=2.8.3",
 ]
 # https://pypi.org/project/flash-attn-4/ is for hopper and blackwell
 flash4 = [
