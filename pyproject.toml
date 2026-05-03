@@ -11,7 +11,7 @@ dependencies = [
 	"transformers>=5.4.0",
 	"accelerate>=0.26.0",
 	"bitsandbytes>=0.49.2",
-	"hf_xet>=1.1.10",
+	"hf_xet>=1.4.3",
 	"torch",
 	"torchvision",
 ]
