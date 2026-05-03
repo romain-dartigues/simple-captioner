@@ -2,6 +2,7 @@
 import os
 import re
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from logging import basicConfig, getLogger
 from queue import Empty, Full, Queue
 from time import monotonic
@@ -31,7 +32,17 @@ DEFAULT_PROMPT = (
 DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 DEFAULT_QUANT = "8-bit"  # "None" | "8-bit" | "4-bit"
 DEFAULT_ATTN = "eager" if os.name == "nt" else "flash_attention_2"
-PREFETCH_QUEUE_SIZE = 4  # how many preprocessed samples may sit ahead of the GPU
+
+# Default sliders. batch_size starts at 1 (safe on any VRAM); a future
+# commit may bump it after model load based on free VRAM.
+# prefetch_workers default scales with the host CPU count but stays
+# modest because preprocessing is much cheaper than GPU generation —
+# extra workers mostly help once batch_size is high enough that the
+# processor's per-batch CPU cost rivals model.generate.
+DEFAULT_BATCH_SIZE = 1
+DEFAULT_PREFETCH_WORKERS = max(1, min(4, (os.cpu_count() or 2) // 2))
+MAX_BATCH_SIZE = 16
+MAX_PREFETCH_WORKERS = 8
 
 
 AVAILABLE_MODELS = [
@@ -172,6 +183,8 @@ control_keys = [
     "one_sentence_mode",
     "retain_preview_checkbox",
     "resolution_mode",
+    "batch_size_slider",
+    "prefetch_workers_slider",
     "status_output",
 ]
 
@@ -423,82 +436,79 @@ def _txt_path_for(media_path: str) -> str:
     )
 
 
-def _prefetch_producer(
+def _put_until_cancel(q: Queue, item: Any, cancel: threading.Event) -> bool:
+    """Block on q.put with periodic cancel checks. Returns False if cancelled."""
+    while not cancel.is_set():
+        try:
+            q.put(item, timeout=0.25)
+            return True
+        except Full:
+            continue
+    return False
+
+
+def _prefetch_dispatcher(
     media_files: list[str],
+    batch_size: int,
     prompt: str,
     summary_mode: bool,
     one_sentence_mode: bool,
     resolution_mode: str,
     skip_existing: bool,
+    executor: ThreadPoolExecutor,
     out_queue: Queue,
     cancel: threading.Event,
 ) -> None:
-    """Run preprocess_one ahead of the GPU consumer. Items are tagged tuples:
-        ("ready", idx, media_path, BatchFeature)  — preprocessed, GPU-ready
-        ("skip",  idx, media_path, None)          — already captioned
-        ("error", idx, media_path, exception)     — preprocess failed
-    Pushes a single `None` sentinel on exit so the consumer knows the stream
-    is over (whether cleanly, on abort, or after an exception)."""
+    """Walks media_files in order; emits queue items in submission order:
+        ("skip",  idx,     path,    None)             — already captioned
+        ("batch", indices, paths,   Future[BatchFeature])
+    Skips don't go through the executor. Non-skipped runs are grouped
+    into contiguous batches of up to batch_size and submitted as
+    Futures. The consumer consumes in order; the executor's pool of
+    workers drives parallel preprocessing of the in-flight Futures."""
     try:
-        for idx, media_path in enumerate(media_files):
+        i = 0
+        n = len(media_files)
+        while i < n:
             if should_abort or cancel.is_set():
                 return
-            if skip_existing and os.path.exists(_txt_path_for(media_path)):
-                item: tuple = ("skip", idx, media_path, None)
-            else:
-                try:
-                    inputs = preprocess_one(
-                        media_path,
-                        prompt,
-                        summary_mode,
-                        one_sentence_mode,
-                        resolution_mode,
-                    )
-                    item = ("ready", idx, media_path, inputs)
-                except Exception as e:
-                    logger.exception("Preprocess failed for %s", media_path)
-                    item = ("error", idx, media_path, e)
-            while not cancel.is_set():
-                try:
-                    out_queue.put(item, timeout=0.25)
+            path_i = media_files[i]
+            if skip_existing and os.path.exists(_txt_path_for(path_i)):
+                if not _put_until_cancel(out_queue, ("skip", i, path_i, None), cancel):
+                    return
+                i += 1
+                continue
+            indices = [i]
+            paths = [path_i]
+            j = i + 1
+            while j < n and len(indices) < batch_size:
+                pj = media_files[j]
+                if skip_existing and os.path.exists(_txt_path_for(pj)):
                     break
-                except Full:
-                    continue
-            else:
+                indices.append(j)
+                paths.append(pj)
+                j += 1
+            try:
+                fut: Future = executor.submit(
+                    preprocess_batch,
+                    paths,
+                    prompt,
+                    summary_mode,
+                    one_sentence_mode,
+                    resolution_mode,
+                )
+            except RuntimeError:
+                # executor was shut down (abort path)
                 return
+            if not _put_until_cancel(out_queue, ("batch", indices, paths, fut), cancel):
+                fut.cancel()
+                return
+            i = j
     finally:
         try:
             out_queue.put(None, timeout=0.25)
         except Full:
             pass
-
-
-def _process_ready_item(idx, total_media, media_path, inputs, folder_path, max_tokens):
-    """Run GPU + decode + write for one prefetched-ready sample. Returns
-    (status, media_to_show, media_name_markdown, caption, progress, elapsed_marker)
-    where elapsed_marker is `None` so the caller can stamp the wall-clock."""
-    t_gen_start = monotonic()
-    generated_ids, input_ids = run_generate(inputs, max_tokens)
-    t_gen_end = monotonic()
-    caption = decode_one(generated_ids, input_ids)
-    t_dec_end = monotonic()
-    logger.debug(
-        "caption timings (s): gen=%.3f dec=%.3f path=%s",
-        t_gen_end - t_gen_start,
-        t_dec_end - t_gen_end,
-        media_path,
-    )
-    media_to_show = Image.open(media_path) if is_image_file(media_path) else None
-    with open(_txt_path_for(media_path), "w", encoding="utf-8") as f:
-        f.write(caption)
-    rel_path = os.path.relpath(media_path, folder_path)
-    return (
-        f"🖼️ Processing {idx + 1}/{total_media}: {rel_path}",
-        media_to_show,
-        f"**File:** `{rel_path}`",
-        caption,
-        int(((idx + 1) / total_media) * 100),
-    )
 
 
 def _build_abort_yield():
@@ -508,6 +518,31 @@ def _build_abort_yield():
     control_updates[status_index] = gradio.update(value="⛔ Aborted by user.")
     control_updates[abort_index] = gradio.update(interactive=False)
     return ("⛔ Aborted by user.", None, None, "Aborted.", 0, "", *control_updates)
+
+
+def _resolve_batch(future: Future, max_tokens: int):
+    """Await the preprocess Future, run the GPU step, decode. Returns
+    (captions, n_samples, error_or_none). On error, captions is None."""
+    try:
+        inputs = future.result()
+    except Exception as e:
+        logger.exception("Preprocess failed: %s", e)
+        return None, 0, e
+    try:
+        t_gen_start = monotonic()
+        generated_ids, input_ids = run_generate(inputs, max_tokens)
+        t_gen_end = monotonic()
+        captions = decode_batch(generated_ids, input_ids)
+        logger.debug(
+            "batch timings (s): gen=%.3f dec=%.3f n=%d",
+            t_gen_end - t_gen_start,
+            monotonic() - t_gen_end,
+            len(captions),
+        )
+        return captions, len(captions), None
+    except Exception as e:
+        logger.exception("Generation failed: %s", e)
+        return None, 0, e
 
 
 def _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefetch_queue, start_time):
@@ -521,7 +556,7 @@ def _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefe
     failed_media = 0
     last_media_to_show = None
     last_caption = ""
-    last_media_name_markdown = ""
+    last_name_md = ""
     elapsed_str = ""
 
     while True:
@@ -537,16 +572,17 @@ def _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefe
         if item is None:
             break
 
-        kind, idx, media_path, payload = item
-        rel_path = os.path.relpath(media_path, folder_path)
+        kind = item[0]
 
         if kind == "skip":
+            _, idx, media_path, _ = item
+            rel_path = os.path.relpath(media_path, folder_path)
             skipped_media += 1
             elapsed_str = _format_elapsed_str(start_time)
             yield (
                 f"⏭️ Skipped {idx + 1}/{total_media}: {rel_path} (already captioned)",
                 last_media_to_show if retain_preview else None,
-                last_media_name_markdown if retain_preview else None,
+                last_name_md if retain_preview else None,
                 last_caption if retain_preview else "Skipped (already captioned)",
                 int(((idx + 1) / total_media) * 100),
                 elapsed_str,
@@ -554,36 +590,50 @@ def _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefe
             )
             continue
 
-        if kind == "error":
-            failed_media += 1
-            logger.error("Failed processing file: %s: %s", media_path, payload)
-            yield (
-                f"⚠️ Error processing {media_path}: {payload}",
-                None, None, "Error in captioning.",
-                0, elapsed_str, *start_process(),
-            )
+        # kind == "batch"
+        _, indices, paths, future = item
+        captions, _n, err = _resolve_batch(future, max_tokens)
+        if err is not None:
+            failed_media += len(indices)
+            for media_path in paths:
+                yield (
+                    f"⚠️ Error processing {media_path}: {err}",
+                    None, None, "Error in captioning.",
+                    0, elapsed_str, *start_process(),
+                )
             continue
 
-        try:
-            status, media_to_show, name_md, caption, progress = _process_ready_item(
-                idx, total_media, media_path, payload, folder_path, max_tokens,
-            )
-        except Exception as e:
-            failed_media += 1
-            logger.exception("Generation failed for %s", media_path)
-            yield (
-                f"⚠️ Error processing {media_path}: {e}",
-                None, None, "Error in captioning.",
-                0, elapsed_str, *start_process(),
-            )
-            continue
+        for idx, media_path, caption in zip(indices, paths, captions):
+            try:
+                with open(_txt_path_for(media_path), "w", encoding="utf-8") as f:
+                    f.write(caption)
+            except OSError as e:
+                logger.exception("Write failed for %s", media_path)
+                failed_media += 1
+                yield (
+                    f"⚠️ Error writing {media_path}: {e}",
+                    None, None, "Error in captioning.",
+                    0, elapsed_str, *start_process(),
+                )
+                continue
 
-        elapsed_str = _format_elapsed_str(start_time)
-        last_media_to_show = media_to_show
-        last_caption = caption
-        last_media_name_markdown = name_md
-        processed_media += 1
-        yield (status, media_to_show, name_md, caption, progress, elapsed_str, *start_process())
+            rel_path = os.path.relpath(media_path, folder_path)
+            name_md = f"**File:** `{rel_path}`"
+            media_to_show = Image.open(media_path) if is_image_file(media_path) else None
+            elapsed_str = _format_elapsed_str(start_time)
+            last_media_to_show = media_to_show
+            last_caption = caption
+            last_name_md = name_md
+            processed_media += 1
+            yield (
+                f"🖼️ Processing {idx + 1}/{total_media}: {rel_path}",
+                media_to_show,
+                name_md,
+                caption,
+                int(((idx + 1) / total_media) * 100),
+                elapsed_str,
+                *start_process(),
+            )
 
     logger.info("processing complete: %r %.3f", processed_media, monotonic() - start_time)
     yield (
@@ -591,7 +641,7 @@ def _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefe
         f"processed {processed_media} media in {elapsed_str}, skipped {skipped_media} media."
         f"Failed to process {failed_media} media (inaccessible, unknown or broken file)",
         last_media_to_show,
-        last_media_name_markdown,
+        last_name_md,
         last_caption,
         None,
         None,
@@ -608,12 +658,19 @@ def process_folder(
     one_sentence_mode,
     retain_preview,
     resolution_mode,
+    batch_size,
+    prefetch_workers,
 ):
+    batch_size = max(1, int(batch_size))
+    prefetch_workers = max(1, int(prefetch_workers))
+
     logger.debug(
         "starting folder processing: model=%s quant=%s folder=%s skip_existing=%s "
-        "max_tokens=%s summary=%s one_sentence=%s retain_preview=%s resolution=%s should_abort=%s",
+        "max_tokens=%s summary=%s one_sentence=%s retain_preview=%s resolution=%s "
+        "batch_size=%s prefetch_workers=%s should_abort=%s",
         current_model_id, current_quant, folder_path, skip_existing,
-        max_tokens, summary_mode, one_sentence_mode, retain_preview, resolution_mode, should_abort,
+        max_tokens, summary_mode, one_sentence_mode, retain_preview, resolution_mode,
+        batch_size, prefetch_workers, should_abort,
     )
 
     if not folder_path.strip():
@@ -640,40 +697,45 @@ def process_folder(
 
     start_time = monotonic()
 
-    # Prefetch CPU-side preprocessing on a worker thread so it overlaps
-    # with model.generate on the GPU. See _prefetch_producer for the
-    # queue item taxonomy.
-    prefetch_queue: Queue = Queue(maxsize=PREFETCH_QUEUE_SIZE)
+    # Bound the in-flight Futures so we don't preprocess far ahead of
+    # the GPU. Total in-flight ≈ queue_size + workers (queue holds
+    # already-submitted, workers each may hold one running task).
+    prefetch_queue: Queue = Queue(maxsize=max(2, prefetch_workers * 2))
     cancel = threading.Event()
-    producer_thread = threading.Thread(
-        target=_prefetch_producer,
-        name="caption-prefetch",
+    executor = ThreadPoolExecutor(max_workers=prefetch_workers, thread_name_prefix="caption-prep")
+    dispatcher = threading.Thread(
+        target=_prefetch_dispatcher,
+        name="caption-dispatch",
         daemon=True,
         kwargs={
             "media_files": media_files,
+            "batch_size": batch_size,
             "prompt": prompt,
             "summary_mode": summary_mode,
             "one_sentence_mode": one_sentence_mode,
             "resolution_mode": resolution_mode,
             "skip_existing": skip_existing,
+            "executor": executor,
             "out_queue": prefetch_queue,
             "cancel": cancel,
         },
     )
-    producer_thread.start()
+    dispatcher.start()
 
     try:
         yield from _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefetch_queue, start_time)
     finally:
         cancel.set()
-        # Drain so the producer's blocked .put(...) can return and the
-        # thread exits before we leave the generator.
+        # Drain so a dispatcher blocked on .put(...) can wake.
         try:
             while True:
                 prefetch_queue.get_nowait()
         except Empty:
             pass
-        producer_thread.join(timeout=2.0)
+        # Cancel queued (not-yet-running) preprocessing tasks; running ones
+        # finish naturally. wait=False so we don't block the generator.
+        executor.shutdown(wait=False, cancel_futures=True)
+        dispatcher.join(timeout=2.0)
 
 
 basicConfig(
@@ -770,6 +832,32 @@ with gradio.Blocks() as iface:  # type: ignore
         )
 
     with gradio.Row():
+        ui_e["batch_size_slider"] = gradio.Slider(
+            label="📦 Batch Size",
+            minimum=1,
+            maximum=MAX_BATCH_SIZE,
+            value=DEFAULT_BATCH_SIZE,
+            step=1,
+            info=(
+                "Samples per model.generate() call. Higher = better GPU utilization, "
+                "but VRAM scales roughly linearly. Start at 1 and raise until VRAM "
+                "headroom shrinks."
+            ),
+        )
+        ui_e["prefetch_workers_slider"] = gradio.Slider(
+            label="🧵 Prefetch Workers",
+            minimum=1,
+            maximum=MAX_PREFETCH_WORKERS,
+            value=DEFAULT_PREFETCH_WORKERS,
+            step=1,
+            info=(
+                f"CPU threads preprocessing batches ahead of the GPU. "
+                f"Default {DEFAULT_PREFETCH_WORKERS} guessed from "
+                f"cpu_count={os.cpu_count() or '?'}."
+            ),
+        )
+
+    with gradio.Row():
         ui_e["reset_button"] = gradio.Button("🔄 Reset to Default Prompt")
         ui_e["start_button"] = gradio.Button("🚀 Start Processing", interactive=True)
         ui_e["abort_button"] = gradio.Button("⛔ Abort", interactive=False)
@@ -817,6 +905,8 @@ with gradio.Blocks() as iface:  # type: ignore
             ui_e["one_sentence_mode"],
             ui_e["retain_preview_checkbox"],
             ui_e["resolution_mode"],
+            ui_e["batch_size_slider"],
+            ui_e["prefetch_workers_slider"],
         ],
         outputs=[
             ui_e["status_output"],
