@@ -243,6 +243,29 @@ def get_model_info():
     return model_name, device, f"{vram_used} / {vram_total}", dtype, str(model.config)
 
 
+def suggest_batch_size() -> int:
+    """Heuristic for the Batch Size slider after a model is loaded.
+    Buckets free post-load VRAM into safe defaults — not a tight upper
+    bound, just a reasonable starting point the user can raise.
+
+    The free-VRAM number is what's left for activations + KV cache after
+    the weights are resident. Per-sample cost grows with max_tokens and
+    image resolution, both of which we don't know here, so we stay
+    conservative and let the user climb."""
+    if not torch.cuda.is_available() or model is None:
+        return DEFAULT_BATCH_SIZE
+    total = torch.cuda.get_device_properties(0).total_memory
+    allocated = torch.cuda.memory_allocated(0)
+    free_gb = max(0.0, (total - allocated) / 1e9)
+    if free_gb >= 12:
+        return 8
+    if free_gb >= 8:
+        return 4
+    if free_gb >= 4:
+        return 2
+    return 1
+
+
 logger.debug("CUDA availability: %s", torch.cuda.is_available())
 
 
@@ -789,9 +812,13 @@ with gradio.Blocks() as iface:  # type: ignore
     def _ui_load_model(sel, custom_id, quant, attn):
         model_id = custom_id.strip() if sel == "Custom..." and custom_id and custom_id.strip() else sel
         name, device, vram, dtype, cfg = load_selected_model(model_id, quant, attn)
-        status = f"✅ Loaded '{model_id}' with {quant} quantization ({attn})."
+        suggested_bs = suggest_batch_size()
+        status = (
+            f"✅ Loaded '{model_id}' with {quant} quantization ({attn}). "
+            f"Suggested batch size: {suggested_bs}."
+        )
         logger.debug("status: %s", status)
-        return status, name, device, vram, dtype, cfg
+        return status, name, device, vram, dtype, cfg, gradio.update(value=suggested_bs)
 
     with gradio.Accordion("⚙️ Model Information", open=False):
         model_name_display = gradio.Textbox(label="Model Name", interactive=False)
@@ -949,6 +976,7 @@ with gradio.Blocks() as iface:  # type: ignore
             vram_display,
             dtype_display,
             config_display,
+            ui_e["batch_size_slider"],
         ],
     )
     gradio.Blocks.load(
