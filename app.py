@@ -664,7 +664,6 @@ def _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefe
             last_caption = caption
             last_name_md = name_md
             processed_media += 1
-            logger.info(f"🖼️ Processed {idx + 1}/{total_media}: {rel_path} in {elapsed_str}")
             yield (
                 f"🖼️ Processing {idx + 1}/{total_media}: {rel_path}",
                 media_to_show,
@@ -675,7 +674,12 @@ def _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefe
                 *start_process(),
             )
 
-    logger.info("processing complete: %r %.3f", processed_media, monotonic() - start_time)
+    logger.info(
+        "processing complete: %r %.3f; average %.3fs per media",
+        processed_media,
+        monotonic() - start_time,
+        (monotonic() - start_time) / processed_media,
+    )
     yield (
         "✅ Processing complete!"
         f"processed {processed_media} media in {elapsed_str}, skipped {skipped_media} media."
