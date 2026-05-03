@@ -29,7 +29,7 @@ DEFAULT_PROMPT = (
     "In a concise way, describe this media, it's background,"
     "composition, style, people, acts, racial traits, physical features, clothes, positions, objects, etc."
 )
-DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
+DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
 DEFAULT_QUANT = "8-bit"  # "None" | "8-bit" | "4-bit"
 DEFAULT_ATTN = "eager" if os.name == "nt" else "flash_attention_2"
 
