@@ -31,22 +31,6 @@ DEFAULT_QUANT = "8-bit"  # "None" | "8-bit" | "4-bit"
 DEFAULT_ATTN = "eager" if os.name == "nt" else "flash_attention_2"
 
 
-PRESETS = {
-    "auto": {
-        "min_pixels": 256 * 28 * 28,
-        "max_pixels": 896 * 28 * 28,
-    },
-    "fast": {
-        "resized_height": 392,
-        "resized_width": 392,
-    },
-    "high": {
-        "resized_height": 728,
-        "resized_width": 728,
-    },
-}
-
-
 AVAILABLE_MODELS = [
     "Qwen/Qwen3.5-4B",
     "Qwen/Qwen3.5-9B",
