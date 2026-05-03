@@ -15,7 +15,7 @@ from PIL import Image
 from qwen_vl_utils import process_vision_info
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import SpecificPreTrainedModelType
-from transformers.models.auto.modeling_auto import AutoModelForImageTextToText
+from transformers.models.auto.modeling_auto import AutoModelForImageTextToText, AutoModelForCausalLM
 from transformers.models.auto.processing_auto import AutoProcessor
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
@@ -30,8 +30,10 @@ r_caption = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".webm", ".mkv", ".gif", ".flv")
 DEFAULT_PROMPT = (
-    "In a concise way, describe this media, it's background,"
-    "composition, style, people, acts, racial traits, physical features, clothes, positions, objects, etc."
+    "In a concise way, describe this media, it's background, "
+    "composition, lighting, camera, lens, style, ambiance, "
+    "people, emotions, acts, racial traits, physical features, clothes, positions, "
+    "objects, animals, fauna, flora, etc."
 )
 DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
 DEFAULT_QUANT = "8-bit"  # "None" | "8-bit" | "4-bit"
@@ -58,6 +60,7 @@ AVAILABLE_MODELS = [
     "Qwen/Qwen2.5-VL-7B-Instruct",
     # Fastest and lightest. Good for rough captions, OCR, dense regions, and prepasses; weaker for rich uncensored natural-language captions.
     "microsoft/Florence-2-large",
+    "microsoft/Florence-2-large-ft",
     # this is the drop-in alternative of: concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf
     # - Llama-Joycaption-Beta-One-Hf-Llava-Q4_K.gguf
     # - llama-joycaption-beta-one-llava-mmproj-model-f16.gguf
@@ -130,6 +133,9 @@ def load_selected_model(model_id: str, quant_choice: str, attn_impl: str = DEFAU
         model_cls = Qwen3VLForConditionalGeneration
     elif "Qwen2.5-VL" in model_id or "Qwen2_5-VL" in model_id:
         model_cls = Qwen2_5_VLForConditionalGeneration
+    elif "Florence" in model_id:
+        kwargs["trust_remote_code"] = True
+        model_cls = AutoModelForCausalLM
     else:
         model_cls = AutoModelForImageTextToText
 
