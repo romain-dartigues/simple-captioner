@@ -572,7 +572,7 @@ with gradio.Blocks() as iface:  # type: ignore
         ui_e["load_button"] = gradio.Button("📦 Load / Reload Model")
 
     def _toggle_custom(choice):
-        return gradio.update(visible=(choice == "Custom…"))
+        return gradio.update(visible=(choice == "Custom..."))
 
     model_dropdown.change(_toggle_custom, inputs=[model_dropdown], outputs=[custom_model_box])
 
