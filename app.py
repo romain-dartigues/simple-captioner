@@ -6,17 +6,21 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from logging import basicConfig, getLogger
 from queue import Empty, Full, Queue
 from time import monotonic
-from typing import Any
+from typing import Any, cast
 
 # dependencies
 import gradio
 import torch
 from PIL import Image
 from qwen_vl_utils import process_vision_info
+from transformers.generation import GenerationMixin
+from transformers.modeling_utils import SpecificPreTrainedModelType
 from transformers.models.auto.modeling_auto import AutoModelForImageTextToText
+from transformers.models.auto.processing_auto import AutoProcessor
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+from transformers.processing_utils import ProcessorMixin
 from transformers.utils.quantization_config import BitsAndBytesConfig
 
 logger = getLogger(__name__)
@@ -126,15 +130,14 @@ def load_selected_model(model_id: str, quant_choice: str, attn_impl: str = DEFAU
 
     try:
         model = model_cls.from_pretrained(model_id, **kwargs)
-    except Exception:
+    except ImportError:
         if attn_impl == "flash_attention_2":
             kwargs["attn_implementation"] = "eager"
             model = model_cls.from_pretrained(model_id, **kwargs)
         else:
             raise
-    from transformers import AutoProcessor as _AP
 
-    processor = _AP.from_pretrained(model_id)
+    processor = AutoProcessor.from_pretrained(model_id)
 
     # Left padding is required for correct batched causal-LM generation:
     # all sequences must share the same right edge so model.generate
@@ -230,7 +233,8 @@ def get_model_info():
     if model is None:
         return "Model not loaded.", "N/A", "N/A", "N/A", "N/A"
 
-    model_name = model.config._name_or_path if hasattr(model.config, "_name_or_path") else "Unknown Model"
+    model = cast(SpecificPreTrainedModelType, model)
+    model_name = getattr(model.config, "_name_or_path", "Unknown Model")
     device = "CUDA" if torch.cuda.is_available() else "CPU"
 
     if torch.cuda.is_available():
@@ -322,7 +326,9 @@ def preprocess_batch(
     Concatenates per-sample images/videos in positional order — the
     processor matches the i-th `<|image_pad|>` text token to the i-th
     image across the flat list, so order matters."""
+    global processor
     assert processor is not None, "Processor must be loaded before preprocessing."
+    processor = cast(ProcessorMixin, processor)
     if not media_paths:
         raise ValueError("preprocess_batch requires at least one media path")
     qwen35 = is_qwen35_model(current_model_id)
@@ -339,7 +345,7 @@ def preprocess_batch(
                 continue_final_message=qwen35,
             )
         )
-        imgs, vids = process_vision_info(messages)
+        imgs, vids = process_vision_info(messages)[:2]
         if imgs:
             images_acc.extend(imgs)
         if vids:
@@ -370,7 +376,9 @@ def run_generate(inputs, max_tokens: int):
     model.generate, return (generated_ids, input_ids) on CPU. Mutates
     `inputs` (the .to() call rebinds its tensors to GPU); caller should
     not reuse the CPU view."""
+    global model
     assert model is not None, "Model must be loaded before generating."
+    model = cast(GenerationMixin, model)
     inputs_gpu = inputs.to("cuda", non_blocking=True)
     with torch.inference_mode():
         generated_ids = model.generate(**inputs_gpu, max_new_tokens=max_tokens)
@@ -381,7 +389,9 @@ def decode_batch(generated_ids, input_ids) -> list[str]:
     """Decode a [B, L_out] generated_ids tensor into a list of B caption
     strings, trimming each by the corresponding input length and
     stripping Qwen3.5 think tags when present."""
+    global processor
     assert processor is not None, "Processor must be loaded before decoding."
+    processor = cast(ProcessorMixin, processor)
     trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(input_ids, generated_ids)]
     captions = processor.batch_decode(
         trimmed,
@@ -538,7 +548,7 @@ def _build_abort_yield():
     control_updates = enable_controls_dict()
     control_updates[status_index] = gradio.update(value="⛔ Aborted by user.")
     control_updates[abort_index] = gradio.update(interactive=False)
-    return ("⛔ Aborted by user.", None, None, "Aborted.", 0, "", *control_updates)
+    return "⛔ Aborted by user.", None, None, "Aborted.", 0, "", *control_updates
 
 
 def _resolve_batch(future: Future, max_tokens: int):
@@ -713,11 +723,11 @@ def process_folder(
     )
 
     if not folder_path.strip():
-        yield ("⚠️ Please enter a valid folder path.", None, None, "No media to process.", 0, "", *finish_process())
+        yield "⚠️ Please enter a valid folder path.", None, None, "No media to process.", 0, "", *finish_process()
         return
 
     if not os.path.exists(folder_path):
-        yield (f"❌ Folder not found: {folder_path}", None, None, "No media to process.", 0, "", *finish_process())
+        yield f"❌ Folder not found: {folder_path}", None, None, "No media to process.", 0, "", *finish_process()
         return
 
     media_files = [
