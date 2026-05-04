@@ -17,6 +17,7 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import SpecificPreTrainedModelType
 from transformers.models.auto.modeling_auto import AutoModelForImageTextToText, AutoModelForCausalLM
 from transformers.models.auto.processing_auto import AutoProcessor
+from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
@@ -38,6 +39,9 @@ DEFAULT_PROMPT = (
 DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
 DEFAULT_QUANT = "8-bit"  # "None" | "8-bit" | "4-bit"
 DEFAULT_ATTN = "eager" if os.name == "nt" else "flash_attention_2"
+DEFAULT_MAX_TOKENS = 256
+
+JOYCAPTION_SYSTEM_PROMPT = "You are a helpful image captioner."
 
 # Default sliders. batch_size starts at 1 (safe on any VRAM); a future
 # commit may bump it after model load based on free VRAM.
@@ -61,10 +65,14 @@ AVAILABLE_MODELS = [
     # Fastest and lightest. Good for rough captions, OCR, dense regions, and prepasses; weaker for rich uncensored natural-language captions.
     "microsoft/Florence-2-large",
     "microsoft/Florence-2-large-ft",
-    # this is the drop-in alternative of: concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf
-    # - Llama-Joycaption-Beta-One-Hf-Llava-Q4_K.gguf
-    # - llama-joycaption-beta-one-llava-mmproj-model-f16.gguf
-    "heavlav/llama-joycaption-beta-one-hf-llava-4bit",
+    # JoyCaption Beta One (LLaVA: Llama 3.1 8B + SigLIP). Pick 4-bit quant
+    # for 12 GB GPUs (~6 GB resident); 8-bit fits but is tight (~10 GB).
+    # The pre-quantized `heavlav/...-4bit` mirror is intentionally NOT listed:
+    # its vision tower is bnb-quantized and crashes inside SigLIP's
+    # nn.MultiheadAttention (Byte vs BFloat16 dtype mismatch). Loading the
+    # un-quantized fancyfeast checkpoint here lets us skip the vision tower
+    # from quantization at load time, which sidesteps the bug.
+    "fancyfeast/llama-joycaption-beta-one-hf-llava",
     "Custom...",
 ]
 
@@ -87,17 +95,40 @@ def preferred_compute_dtype():
     return torch.float16
 
 
-def build_bnb_config(quant_choice: str):
+def build_bnb_config(quant_choice: str, skip_modules: list[str] | None = None):
+    """`skip_modules` keeps the named submodules out of bnb quantization
+    (despite the name, `llm_int8_skip_modules` is honored for both 4-bit
+    and 8-bit). Useful for vision towers that internally call
+    F.multi_head_attention_forward, which bypasses Linear4bit.forward and
+    crashes on bnb-quantized weights with a dtype mismatch."""
     if quant_choice == "8-bit":
-        return BitsAndBytesConfig(load_in_8bit=True)
+        return BitsAndBytesConfig(load_in_8bit=True, llm_int8_skip_modules=skip_modules)
     if quant_choice == "4-bit":
-        return BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=preferred_compute_dtype())
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=preferred_compute_dtype(),
+            llm_int8_skip_modules=skip_modules,
+        )
     return None
 
 
 def is_qwen35_model(model_id: str) -> bool:
     """Qwen3.5 models use a different class and require thinking-mode handling."""
     return "Qwen3.5" in model_id or "Qwen3_5" in model_id
+
+
+def is_joycaption_model(model_id: str) -> bool:
+    """JoyCaption (LLaVA-based, Llama 3.1 8B + SigLIP) needs a different
+    chat template, separate-image processor call, and sampling generation."""
+    return "joycaption" in model_id.lower()
+
+
+def _is_prequantized(model_id: str) -> bool:
+    """Heuristic: model IDs ending in -4bit / -8bit are typically already
+    bitsandbytes-quantized at save time. Re-applying a BnB config on top
+    can conflict with the saved quantization_config — skip it and let HF
+    load the baked-in settings."""
+    return model_id.lower().endswith(("-4bit", "-8bit", "-4-bit", "-8-bit"))
 
 
 def unload_model():
@@ -107,6 +138,36 @@ def unload_model():
     processor = None
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _configure_tokenizer_for_batching(processor_obj, model_obj) -> None:
+    """Two batched-generation prerequisites that depend on the tokenizer:
+
+    1. Left padding — required for correct batched causal-LM generation:
+       all sequences must share the same right edge so model.generate
+       continues each from its true last token. Right padding would make
+       the model resume from pad tokens for the shorter sequences.
+
+    2. pad_token fallback — Llama-family tokenizers (e.g. JoyCaption's
+       Llama 3.1) ship without a pad_token, which breaks any processor
+       call with padding=True. Alias to eos_token (standard Llama
+       workaround; the attention mask still masks the pad positions) and
+       propagate the id to model.generation_config so generate() doesn't
+       fall back with a warning. No-op for Qwen-family tokenizers that
+       already have a pad_token.
+    """
+    tokenizer = getattr(processor_obj, "tokenizer", None)
+    if tokenizer is None:
+        return
+    if getattr(tokenizer, "padding_side", None) is not None:
+        tokenizer.padding_side = "left"
+    if getattr(tokenizer, "pad_token", None) is None:
+        eos = getattr(tokenizer, "eos_token", None)
+        if eos is not None:
+            tokenizer.pad_token = eos
+            gen_cfg = getattr(model_obj, "generation_config", None)
+            if gen_cfg is not None:
+                gen_cfg.pad_token_id = tokenizer.pad_token_id
 
 
 def load_selected_model(model_id: str, quant_choice: str, attn_impl: str = DEFAULT_ATTN):
@@ -124,7 +185,11 @@ def load_selected_model(model_id: str, quant_choice: str, attn_impl: str = DEFAU
         "device_map": "auto",
         "attn_implementation": attn_impl,
     }
-    if bnb := build_bnb_config(quant_choice):
+    # JoyCaption's SigLIP vision tower uses nn.MultiheadAttention internally
+    # and crashes on bnb-quantized weights — skip it from quantization. The
+    # tower is small (~0.4 GB at fp16) so the VRAM cost is negligible.
+    skip_modules = ["vision_tower"] if is_joycaption_model(model_id) else None
+    if not _is_prequantized(model_id) and (bnb := build_bnb_config(quant_choice, skip_modules)):
         kwargs["quantization_config"] = bnb
 
     if is_qwen35_model(model_id):
@@ -133,6 +198,8 @@ def load_selected_model(model_id: str, quant_choice: str, attn_impl: str = DEFAU
         model_cls = Qwen3VLForConditionalGeneration
     elif "Qwen2.5-VL" in model_id or "Qwen2_5-VL" in model_id:
         model_cls = Qwen2_5_VLForConditionalGeneration
+    elif is_joycaption_model(model_id):
+        model_cls = LlavaForConditionalGeneration
     elif "Florence" in model_id:
         kwargs["trust_remote_code"] = True
         model_cls = AutoModelForCausalLM
@@ -149,14 +216,7 @@ def load_selected_model(model_id: str, quant_choice: str, attn_impl: str = DEFAU
             raise
 
     processor = AutoProcessor.from_pretrained(model_id)
-
-    # Left padding is required for correct batched causal-LM generation:
-    # all sequences must share the same right edge so model.generate
-    # continues each from its true last token. Right padding would make
-    # the model resume from pad tokens for the shorter sequences.
-    tokenizer = getattr(processor, "tokenizer", None)
-    if tokenizer is not None and getattr(tokenizer, "padding_side", None) is not None:
-        tokenizer.padding_side = "left"
+    _configure_tokenizer_for_batching(processor, model)
 
     current_model_id = model_id
     current_quant = quant_choice
@@ -326,6 +386,36 @@ def _build_messages(
     return messages
 
 
+def _preprocess_batch_joycaption(
+    media_paths: list[str],
+    prompt: str,
+    summary_mode: bool,
+    one_sentence_mode: bool,
+):
+    """JoyCaption (LLaVA) preprocessing: hard-coded system prompt, the
+    user-facing prompt drives the user turn, image is passed separately to
+    the processor (no qwen_vl_utils, no resolution kwargs — the LLaVA image
+    processor handles sizing internally). Image-only — videos are rejected."""
+    assert processor is not None
+    user_text = _augment_prompt(prompt, summary_mode, one_sentence_mode)
+    messages = [
+        {"role": "system", "content": JOYCAPTION_SYSTEM_PROMPT},
+        {"role": "user", "content": user_text},
+    ]
+    convo_string = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    images: list[Image.Image] = []
+    for path in media_paths:
+        if is_video_file(path):
+            raise ValueError(f"JoyCaption does not support video input: {path}")
+        images.append(Image.open(path).convert("RGB"))
+    return processor(
+        text=[convo_string] * len(media_paths),
+        images=images,
+        padding=True,
+        return_tensors="pt",
+    )
+
+
 def preprocess_batch(
     media_paths: list[str],
     prompt: str,
@@ -342,6 +432,8 @@ def preprocess_batch(
     processor = cast(ProcessorMixin, processor)
     if not media_paths:
         raise ValueError("preprocess_batch requires at least one media path")
+    if is_joycaption_model(current_model_id):
+        return _preprocess_batch_joycaption(media_paths, prompt, summary_mode, one_sentence_mode)
     qwen35 = is_qwen35_model(current_model_id)
     texts: list[str] = []
     images_acc: list[Any] = []
@@ -382,6 +474,24 @@ def preprocess_one(
     return preprocess_batch([media_path], prompt, summary_mode, one_sentence_mode, resolution_mode)
 
 
+def _generation_kwargs(model_id: str, max_tokens: int) -> dict[str, Any]:
+    """Per-family generation kwargs. JoyCaption upstream recommends
+    sampling (temperature=0.6, top_p=0.9); other families stay greedy to
+    preserve the existing per-sample behavior."""
+    kwargs: dict[str, Any] = {"max_new_tokens": max_tokens}
+    if is_joycaption_model(model_id):
+        kwargs.update(
+            {
+                "do_sample": True,
+                "temperature": 0.6,
+                "top_p": 0.9,
+                "suppress_tokens": None,
+                "use_cache": True,
+            }
+        )
+    return kwargs
+
+
 def run_generate(inputs, max_tokens: int):
     """Move a CPU BatchFeature (any batch dim) to GPU in place, run
     model.generate, return (generated_ids, input_ids) on CPU. Mutates
@@ -391,8 +501,17 @@ def run_generate(inputs, max_tokens: int):
     assert model is not None, "Model must be loaded before generating."
     model = cast(GenerationMixin, model)
     inputs_gpu = inputs.to("cuda", non_blocking=True)
+    if is_joycaption_model(current_model_id) and "pixel_values" in inputs_gpu:
+        # LLaVA's vision tower is not BnB-quantized; processor returns
+        # pixel_values as fp32. Cast to the vision tower's dtype so the
+        # SigLIP forward doesn't trip on a dtype mismatch.
+        # In transformers 5.x, LlavaForConditionalGeneration nests it as
+        # `.model.vision_tower` (the inner LlavaModel owns the tower).
+        vt_dtype = next(model.model.vision_tower.parameters()).dtype
+        inputs_gpu["pixel_values"] = inputs_gpu["pixel_values"].to(vt_dtype)
+    gen_kwargs = _generation_kwargs(current_model_id, max_tokens)
     with torch.inference_mode():
-        generated_ids = model.generate(**inputs_gpu, max_new_tokens=max_tokens)
+        generated_ids = model.generate(**inputs_gpu, **gen_kwargs)
     return generated_ids.cpu(), inputs_gpu["input_ids"].cpu()
 
 
@@ -893,7 +1012,7 @@ with gradio.Blocks() as iface:  # type: ignore
 
     with gradio.Row():
         ui_e["max_tokens_slider"] = gradio.Slider(
-            label="🧾 Max Tokens", minimum=32, maximum=1024 * 8, value=128, step=16
+            label="🧾 Max Tokens", minimum=32, maximum=1024 * 8, value=DEFAULT_MAX_TOKENS, step=16
         )
         ui_e["resolution_mode"] = gradio.Dropdown(
             label="Image Resolution",

@@ -54,13 +54,31 @@ Cleanup on abort/finish (`finally` in `process_folder`): set the `cancel` event,
 
 ### Model class dispatch
 
-`load_selected_model()` picks one of three concrete classes based on substring match against the model id, falling back to `AutoModelForImageTextToText`:
+`load_selected_model()` picks one of several concrete classes based on substring match against the model id, falling back to `AutoModelForImageTextToText`:
 
 - `Qwen3.5` / `Qwen3_5` → `Qwen3_5ForConditionalGeneration` (text-only; uses thinking-mode prompt)
 - `Qwen3-VL` → `Qwen3VLForConditionalGeneration`
 - `Qwen2.5-VL` / `Qwen2_5-VL` → `Qwen2_5_VLForConditionalGeneration`
+- `joycaption` (case-insensitive substring) → `LlavaForConditionalGeneration` — see "JoyCaption / LLaVA family" below
 
 When adding a new model family, extend this dispatch *and* `is_qwen35_model()` if it shares Qwen3.5's thinking-mode quirk.
+
+### Pre-quantized model IDs
+
+`_is_prequantized()` matches IDs ending in `-4bit` / `-8bit` (and the dashed `-4-bit` / `-8-bit` variants) and suppresses our `BitsAndBytesConfig` kwarg in `load_selected_model()`. These checkpoints already carry a `quantization_config` in their `config.json` and HF will load them with the saved settings; layering our config on top can conflict. For pre-quantized variants the UI's quant radio is effectively ignored — the saved quant wins.
+
+### JoyCaption / LLaVA family
+
+JoyCaption Beta One (`fancyfeast/llama-joycaption-beta-one-hf-llava`) is a LLaVA model: Llama 3.1 8B + SigLIP vision tower. It does **not** share the Qwen path:
+
+- **Messages**: `_preprocess_batch_joycaption()` builds a fixed `[{system: JOYCAPTION_SYSTEM_PROMPT}, {user: <augmented prompt>}]` chat. The system prompt is hard-coded — the user-facing prompt textbox drives only the user turn. No `process_vision_info`, no resolution kwargs (LLaVA's image processor handles sizing). Image is passed separately to `processor(text=..., images=...)`.
+- **Image-only**: videos raise `ValueError` from preprocessing — the model has no video path.
+- **Generation**: `_generation_kwargs()` adds `do_sample=True, temperature=0.6, top_p=0.9, suppress_tokens=None, use_cache=True` for JoyCaption. Other families stay greedy.
+- **pixel_values dtype**: `run_generate()` casts `pixel_values` to the SigLIP vision tower's parameter dtype before generation. The processor returns fp32; the vision tower is in fp16/bf16 (it's deliberately not BnB-quantized — see next point), so without the cast SigLIP's forward errors on a dtype mismatch. The tower lives at `model.model.vision_tower` in transformers 5.x.
+- **Vision tower is skipped from bnb quantization**: `load_selected_model` adds `llm_int8_skip_modules=["vision_tower"]` to `BitsAndBytesConfig` whenever `is_joycaption_model(...)` is true (`llm_int8_skip_modules` is honored for both 4-bit and 8-bit despite the name). Required because SigLIP's `nn.MultiheadAttention` calls `F.multi_head_attention_forward → F.linear` directly with the raw weight tensor, bypassing `Linear4bit.forward`'s dequantization. With a quantized vision-tower weight that path crashes with `self and mat2 must have the same dtype, but got BFloat16 and Byte`. Cost: ~0.4 GB extra VRAM for the fp16/bf16 vision tower — negligible vs. the LM weights.
+- **Pre-quantized variants are not listed**: `heavlav/llama-joycaption-beta-one-hf-llava-4bit` baked the quant into the vision tower at save time, hits the same bug, and we can't undo it from our side. Stick with the un-quantized fancyfeast checkpoint + our own bnb config.
+- **`DEFAULT_MAX_TOKENS = 256`**: JoyCaption captions are typically 200–400 tokens; the previous 128 default truncated.
+- **`pad_token` fallback**: Llama-3.1's tokenizer ships without a `pad_token`, which breaks the processor's `padding=True`. `load_selected_model` aliases `pad_token = eos_token` whenever it's missing (no-op for Qwen tokenizers that already have one) and propagates the id to `model.generation_config.pad_token_id`.
 
 ### Qwen3.5 thinking-mode handling
 
