@@ -1,11 +1,12 @@
 # stdlib
 import os
 import re
-import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from logging import basicConfig, getLogger
+from pathlib import Path
 from queue import Empty, Full, Queue
 from time import monotonic
+from threading import Event, Thread
 from typing import Any, cast
 
 # dependencies
@@ -598,14 +599,11 @@ def _sanitize_caption_extension(ext: str) -> str:
     return cleaned or "txt"
 
 
-def _caption_path_for(media_path: str, extension: str = "txt") -> str:
-    return os.path.join(
-        os.path.dirname(media_path),
-        os.path.splitext(os.path.basename(media_path))[0] + "." + extension,
-    )
+def _caption_path_for(media_path: str, extension: str = "txt") -> Path:
+    return Path(media_path).with_suffix("." + extension)
 
 
-def _put_until_cancel(q: Queue, item: Any, cancel: threading.Event) -> bool:
+def _put_until_cancel(q: Queue, item: Any, cancel: Event) -> bool:
     """Block on q.put with periodic cancel checks. Returns False if cancelled."""
     while not cancel.is_set():
         try:
@@ -627,7 +625,7 @@ def _prefetch_dispatcher(
     caption_extension: str,
     executor: ThreadPoolExecutor,
     out_queue: Queue,
-    cancel: threading.Event,
+    cancel: Event,
 ) -> None:
     """Walks media_files in order; emits queue items in submission order:
         ("skip",  idx,     path,    None)             — already captioned
@@ -643,7 +641,7 @@ def _prefetch_dispatcher(
             if should_abort or cancel.is_set():
                 return
             path_i = media_files[i]
-            if skip_existing and os.path.exists(_caption_path_for(path_i, caption_extension)):
+            if skip_existing and _caption_path_for(path_i, caption_extension).exists():
                 if not _put_until_cancel(out_queue, ("skip", i, path_i, None), cancel):
                     return
                 i += 1
@@ -653,7 +651,7 @@ def _prefetch_dispatcher(
             j = i + 1
             while j < n and len(indices) < batch_size:
                 pj = media_files[j]
-                if skip_existing and os.path.exists(_caption_path_for(pj, caption_extension)):
+                if skip_existing and _caption_path_for(pj, caption_extension).exists():
                     break
                 indices.append(j)
                 paths.append(pj)
@@ -748,7 +746,7 @@ def _captioning_loop(
 
         if kind == "skip":
             _, idx, media_path, _ = item
-            rel_path = os.path.relpath(media_path, folder_path)
+            rel_path = Path(media_path).relative_to(folder_path)
             skipped_media += 1
             elapsed_str = _format_elapsed_str(start_time)
             yield (
@@ -797,7 +795,7 @@ def _captioning_loop(
                 )
                 continue
 
-            rel_path = os.path.relpath(media_path, folder_path)
+            rel_path = Path(media_path).relative_to(folder_path)
             name_md = f"**File:** `{rel_path}`"
             media_to_show = Image.open(media_path) if is_image_file(media_path) else None
             elapsed_str = _format_elapsed_str(start_time)
@@ -874,15 +872,15 @@ def process_folder(
         yield "⚠️ Please enter a valid folder path.", None, None, "No media to process.", 0, "", *finish_process()
         return
 
-    if not os.path.exists(folder_path):
+    folder = Path(folder_path)
+    if not folder.exists():
         yield f"❌ Folder not found: {folder_path}", None, None, "No media to process.", 0, "", *finish_process()
         return
 
     media_files = [
-        os.path.join(root, file)
-        for root, _, files in os.walk(folder_path)
-        for file in files
-        if is_image_file(file) or is_video_file(file)
+        str(p)
+        for p in folder.rglob("*")
+        if p.is_file() and (is_image_file(p.name) or is_video_file(p.name))
     ]
     total_media = len(media_files)
     if not total_media:
@@ -903,9 +901,9 @@ def process_folder(
     # the GPU. Total in-flight ≈ queue_size + workers (queue holds
     # already-submitted, workers each may hold one running task).
     prefetch_queue: Queue = Queue(maxsize=max(2, prefetch_workers * 2))
-    cancel = threading.Event()
+    cancel = Event()
     executor = ThreadPoolExecutor(max_workers=prefetch_workers, thread_name_prefix="caption-prep")
-    dispatcher = threading.Thread(
+    dispatcher = Thread(
         target=_prefetch_dispatcher,
         name="caption-dispatch",
         daemon=True,
