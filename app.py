@@ -1,10 +1,10 @@
 # stdlib
-import os
 import re
 from concurrent.futures import Future, ThreadPoolExecutor
 from logging import basicConfig, getLogger
 from pathlib import Path
 from queue import Empty, Full, Queue
+from os import cpu_count
 from time import monotonic
 from threading import Event, Thread
 from typing import Any, cast
@@ -40,8 +40,8 @@ DEFAULT_PROMPT = (
 )
 DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
 DEFAULT_QUANT = "8-bit"  # "None" | "8-bit" | "4-bit"
-DEFAULT_ATTN = "eager" if os.name == "nt" else "flash_attention_2"
-DEFAULT_MAX_TOKENS = 256
+DEFAULT_ATTN = "eager"
+DEFAULT_MAX_TOKENS = 2048
 
 JOYCAPTION_SYSTEM_PROMPT = "You are a helpful image captioner."
 
@@ -52,7 +52,7 @@ JOYCAPTION_SYSTEM_PROMPT = "You are a helpful image captioner."
 # extra workers mostly help once batch_size is high enough that the
 # processor's per-batch CPU cost rivals model.generate.
 DEFAULT_BATCH_SIZE = 1
-DEFAULT_PREFETCH_WORKERS = max(1, min(4, (os.cpu_count() or 2) // 2))
+DEFAULT_PREFETCH_WORKERS = max(1, min(4, (cpu_count() or 2) // 2))
 MAX_BATCH_SIZE = 16
 MAX_PREFETCH_WORKERS = 8
 
@@ -600,7 +600,7 @@ def _sanitize_caption_extension(ext: str) -> str:
 
 
 def _caption_path_for(media_path: str, extension: str = "txt") -> Path:
-    return Path(media_path).with_suffix("." + extension)
+    return Path(media_path).with_suffix(f".{extension}")
 
 
 def _put_until_cancel(q: Queue, item: Any, cancel: Event) -> bool:
@@ -950,10 +950,8 @@ with gradio.Blocks() as iface:  # type: ignore
     gradio.Markdown("# Simple Captioner")
     gradio.Markdown(
         "A simple media caption generator for images and video using **[Qwen2.5/3/3.5 VL Instruct](https://huggingface.co/Qwen/)**"
+        "Written by [Olli S.](https://github.com/o-l-l-i)"
     )
-    gradio.Markdown("Supported image formats: png, jpg, jpeg, bmp, gif, webp")
-    gradio.Markdown("Supported video formats: mp4, mov, avi, webm, mkv, gif, flv")
-    gradio.Markdown("Written by [Olli S.](https://github.com/o-l-l-i)")
 
     with gradio.Accordion("⚙️ Model Settings", open=True):
         ui_e["model_dropdown"] = model_dropdown = gradio.Dropdown(
@@ -1008,7 +1006,7 @@ with gradio.Blocks() as iface:  # type: ignore
     with gradio.Row():
         ui_e["folder_input"] = gradio.Textbox(
             label="📁 Folder Path",
-            placeholder="e.g. C:\\Users\\you\\Pictures\\input_images",
+            placeholder=r"e.g. C:\Users\you\Pictures\input_images",
         )
         ui_e["prompt_input"] = gradio.Textbox(label="Custom Prompt", value=DEFAULT_PROMPT)
 
@@ -1066,7 +1064,7 @@ with gradio.Blocks() as iface:  # type: ignore
             info=(
                 f"CPU threads preprocessing batches ahead of the GPU. "
                 f"Default {DEFAULT_PREFETCH_WORKERS} guessed from "
-                f"cpu_count={os.cpu_count() or '?'}."
+                f"cpu_count={cpu_count() or '?'}."
             ),
         )
 
