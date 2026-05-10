@@ -46,6 +46,8 @@ The captioning code is split into pure stages so the prefetcher and batched gene
 2. **Executor pool** — preprocessing workers run `preprocess_batch` in parallel; the dispatcher's submit is non-blocking, queue back-pressure throttles work to in-flight ≈ `queue_size + workers`.
 3. **`_captioning_loop` (consumer, the Gradio generator's body)** — pulls items from the queue in submission order, awaits the Future, runs one `model.generate` per batch, decodes N captions, writes the `.txt` files, and yields one progress update **per sample within the batch** (so progress bar is still per-sample granular even with `batch_size > 1`).
 
+Per-sample console logging (`logger.info` with `[idx/total pct%] action path (elapsed MM:SS)`) lives in `_captioning_loop` for every event (skip / captioned / error). This is the authoritative progress source: `qwen_vl_utils.process_vision_info` chatters to stdout for Qwen models and JoyCaption's path stays silent, so without these explicit lines the console output looks model-dependent. Don't remove them when refactoring the loop.
+
 Cleanup on abort/finish (`finally` in `process_folder`): set the `cancel` event, drain the queue (unblocks dispatcher's `put`), `executor.shutdown(wait=False, cancel_futures=True)` cancels queued-but-unstarted preprocess tasks while running ones finish naturally, then `dispatcher.join(timeout=2.0)`.
 
 ### Left padding is required for batch generation

@@ -100,10 +100,9 @@ def preferred_compute_dtype():
 
 def build_bnb_config(quant_choice: str, skip_modules: list[str] | None = None):
     """`skip_modules` keeps the named submodules out of bnb quantization
-    (despite the name, `llm_int8_skip_modules` is honored for both 4-bit
-    and 8-bit). Useful for vision towers that internally call
-    F.multi_head_attention_forward, which bypasses Linear4bit.forward and
-    crashes on bnb-quantized weights with a dtype mismatch."""
+    (despite the name, `llm_int8_skip_modules` is honored for both 4-bit and 8-bit).
+    Useful for vision towers that internally call F.multi_head_attention_forward,
+    which bypasses Linear4bit.forward and crashes on bnb-quantized weights with a dtype mismatch."""
     if quant_choice == "8-bit":
         return BitsAndBytesConfig(load_in_8bit=True, llm_int8_skip_modules=skip_modules)
     if quant_choice == "4-bit":
@@ -189,8 +188,8 @@ def load_selected_model(model_id: str, quant_choice: str, attn_impl: str = DEFAU
         "attn_implementation": attn_impl,
     }
     # JoyCaption's SigLIP vision tower uses nn.MultiheadAttention internally
-    # and crashes on bnb-quantized weights — skip it from quantization. The
-    # tower is small (~0.4 GB at fp16) so the VRAM cost is negligible.
+    # and crashes on bnb-quantized weights — skip it from quantization.
+    # The tower is small (~0.4 GB at fp16) so the VRAM cost is negligible.
     skip_modules = ["vision_tower"] if is_joycaption_model(model_id) else None
     if not _is_prequantized(model_id) and (bnb := build_bnb_config(quant_choice, skip_modules)):
         kwargs["quantization_config"] = bnb
@@ -406,9 +405,9 @@ def preprocess_batch(
     resolution_mode: str = "auto",
 ):
     """Build a BatchFeature with batch dim len(media_paths) on CPU.
-    Concatenates per-sample images/videos in positional order — the
-    processor matches the i-th `<|image_pad|>` text token to the i-th
-    image across the flat list, so order matters."""
+    Concatenates per-sample images/videos in positional order
+    — the processor matches the i-th `<|image_pad|>` text token
+    to the i-th image across the flat list, so order matters."""
     global processor
     assert processor is not None, "Processor must be loaded before preprocessing."
     if not media_paths:
@@ -700,12 +699,17 @@ def _captioning_loop(
             rel_path = Path(media_path).relative_to(folder_path)
             skipped_media += 1
             elapsed_str = _format_elapsed_str(start_time)
+            percent = int(((idx + 1) / total_media) * 100)
+            logger.info(
+                "[%d/%d %3d%%] skipped %s (elapsed %s)",
+                idx + 1, total_media, percent, rel_path, elapsed_str,
+            )
             yield (
                 f"⏭️ Skipped {idx + 1}/{total_media}: {rel_path} (already captioned)",
                 last_media_to_show if retain_preview else None,
                 last_name_md if retain_preview else None,
                 last_caption if retain_preview else "Skipped (already captioned)",
-                int(((idx + 1) / total_media) * 100),
+                percent,
                 elapsed_str,
                 *start_process(),
             )
@@ -716,7 +720,12 @@ def _captioning_loop(
         captions, _n, err = _resolve_batch(future, max_tokens)
         if err is not None:
             failed_media += len(indices)
-            for media_path in paths:
+            for idx, media_path in zip(indices, paths):
+                rel_path = Path(media_path).relative_to(folder_path)
+                logger.error(
+                    "[%d/%d] error processing %s: %s",
+                    idx + 1, total_media, rel_path, err,
+                )
                 yield (
                     f"⚠️ Error processing {media_path}: {err}",
                     None,
@@ -733,7 +742,11 @@ def _captioning_loop(
                 with open(_caption_path_for(media_path, caption_extension), "w", encoding="utf-8") as f:
                     f.write(caption)
             except OSError as e:
-                logger.exception("Write failed for %s", media_path)
+                rel_path = Path(media_path).relative_to(folder_path)
+                logger.exception(
+                    "[%d/%d] write failed for %s",
+                    idx + 1, total_media, rel_path,
+                )
                 failed_media += 1
                 yield (
                     f"⚠️ Error writing {media_path}: {e}",
@@ -750,25 +763,30 @@ def _captioning_loop(
             name_md = f"**File:** `{rel_path}`"
             media_to_show = Image.open(media_path) if is_image_file(media_path) else None
             elapsed_str = _format_elapsed_str(start_time)
+            percent = int(((idx + 1) / total_media) * 100)
             last_media_to_show = media_to_show
             last_caption = caption
             last_name_md = name_md
             processed_media += 1
+            logger.info(
+                "[%d/%d %3d%%] captioned %s (elapsed %s)",
+                idx + 1, total_media, percent, rel_path, elapsed_str,
+            )
             yield (
                 f"🖼️ Processing {idx + 1}/{total_media}: {rel_path}",
                 media_to_show,
                 name_md,
                 caption,
-                int(((idx + 1) / total_media) * 100),
+                percent,
                 elapsed_str,
                 *start_process(),
             )
 
+    total_elapsed = monotonic() - start_time
+    avg = total_elapsed / processed_media if processed_media else 0.0
     logger.info(
-        "processing complete: %r %.3f; average %.3fs per media",
-        processed_media,
-        monotonic() - start_time,
-        (monotonic() - start_time) / processed_media,
+        "processing complete: processed=%d skipped=%d failed=%d total=%.3fs avg=%.3fs/media",
+        processed_media, skipped_media, failed_media, total_elapsed, avg,
     )
     yield (
         "✅ Processing complete!"
