@@ -48,6 +48,8 @@ The captioning code is split into pure stages so the prefetcher and batched gene
 
 Per-sample console logging (`logger.info` with `[idx/total pct%] action path (elapsed MM:SS)`) lives in `_captioning_loop` for every event (skip / captioned / error). This is the authoritative progress source: `qwen_vl_utils.process_vision_info` chatters to stdout for Qwen models and JoyCaption's path stays silent, so without these explicit lines the console output looks model-dependent. Don't remove them when refactoring the loop.
 
+Run-summary line (`_log_run_summary`) is emitted from `_captioning_loop`'s `finally` block so it fires on every exit path: clean completion (`processing complete: ...`), abort (`processing aborted: ...`), or an unexpected exception (`processing interrupted: ...`). The active label is tracked via `completed_action`, set just before the matching `yield`/`return`. Always update `completed_action` if you add a new exit path.
+
 Cleanup on abort/finish (`finally` in `process_folder`): set the `cancel` event, drain the queue (unblocks dispatcher's `put`), `executor.shutdown(wait=False, cancel_futures=True)` cancels queued-but-unstarted preprocess tasks while running ones finish naturally, then `dispatcher.join(timeout=2.0)`.
 
 ### Left padding is required for batch generation

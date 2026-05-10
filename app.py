@@ -663,13 +663,24 @@ def _resolve_batch(future: Future, max_tokens: int):
         return None, 0, e
 
 
+def _log_run_summary(action: str, processed: int, skipped: int, failed: int, start_time: float) -> None:
+    total_elapsed = monotonic() - start_time
+    avg = total_elapsed / processed if processed else 0.0
+    logger.info(
+        "processing %s: processed=%d skipped=%d failed=%d total=%.3fs avg=%.3fs/media",
+        action, processed, skipped, failed, total_elapsed, avg,
+    )
+
+
 def _captioning_loop(
     folder_path, total_media, max_tokens, retain_preview, caption_extension, prefetch_queue, start_time
 ):
     """Consumer side of the prefetch pipeline. Yields Gradio update tuples.
     Reads `should_abort` (and resets it on consumption) so the abort
-    button works mid-loop. Emits the final summary on clean completion;
-    returns early after the abort yield otherwise."""
+    button works mid-loop. A `try/finally` guarantees the run-summary
+    log line always fires (clean completion, abort, or unexpected
+    exception) — `completed_action` records which path won so the log
+    label is accurate."""
     global should_abort
     processed_media = 0
     skipped_media = 0
@@ -678,127 +689,127 @@ def _captioning_loop(
     last_caption = ""
     last_name_md = ""
     elapsed_str = ""
+    completed_action = "interrupted"
 
-    while True:
-        if should_abort:
-            should_abort = False
-            yield _build_abort_yield()
-            return
+    try:
+        while True:
+            if should_abort:
+                should_abort = False
+                completed_action = "aborted"
+                yield _build_abort_yield()
+                return
 
-        try:
-            item = prefetch_queue.get(timeout=0.25)
-        except Empty:
-            continue
-        if item is None:
-            break
-
-        kind = item[0]
-
-        if kind == "skip":
-            _, idx, media_path, _ = item
-            rel_path = Path(media_path).relative_to(folder_path)
-            skipped_media += 1
-            elapsed_str = _format_elapsed_str(start_time)
-            percent = int(((idx + 1) / total_media) * 100)
-            logger.info(
-                "[%d/%d %3d%%] skipped %s (elapsed %s)",
-                idx + 1, total_media, percent, rel_path, elapsed_str,
-            )
-            yield (
-                f"⏭️ Skipped {idx + 1}/{total_media}: {rel_path} (already captioned)",
-                last_media_to_show if retain_preview else None,
-                last_name_md if retain_preview else None,
-                last_caption if retain_preview else "Skipped (already captioned)",
-                percent,
-                elapsed_str,
-                *start_process(),
-            )
-            continue
-
-        # kind == "batch"
-        _, indices, paths, future = item
-        captions, _n, err = _resolve_batch(future, max_tokens)
-        if err is not None:
-            failed_media += len(indices)
-            for idx, media_path in zip(indices, paths):
-                rel_path = Path(media_path).relative_to(folder_path)
-                logger.error(
-                    "[%d/%d] error processing %s: %s",
-                    idx + 1, total_media, rel_path, err,
-                )
-                yield (
-                    f"⚠️ Error processing {media_path}: {err}",
-                    None,
-                    None,
-                    "Error in captioning.",
-                    0,
-                    elapsed_str,
-                    *start_process(),
-                )
-            continue
-
-        for idx, media_path, caption in zip(indices, paths, captions):
             try:
-                with open(_caption_path_for(media_path, caption_extension), "w", encoding="utf-8") as f:
-                    f.write(caption)
-            except OSError as e:
+                item = prefetch_queue.get(timeout=0.25)
+            except Empty:
+                continue
+            if item is None:
+                break
+
+            kind = item[0]
+
+            if kind == "skip":
+                _, idx, media_path, _ = item
                 rel_path = Path(media_path).relative_to(folder_path)
-                logger.exception(
-                    "[%d/%d] write failed for %s",
-                    idx + 1, total_media, rel_path,
+                skipped_media += 1
+                elapsed_str = _format_elapsed_str(start_time)
+                percent = int(((idx + 1) / total_media) * 100)
+                logger.info(
+                    "[%d/%d %3d%%] skipped %s (elapsed %s)",
+                    idx + 1, total_media, percent, rel_path, elapsed_str,
                 )
-                failed_media += 1
                 yield (
-                    f"⚠️ Error writing {media_path}: {e}",
-                    None,
-                    None,
-                    "Error in captioning.",
-                    0,
+                    f"⏭️ Skipped {idx + 1}/{total_media}: {rel_path} (already captioned)",
+                    last_media_to_show if retain_preview else None,
+                    last_name_md if retain_preview else None,
+                    last_caption if retain_preview else "Skipped (already captioned)",
+                    percent,
                     elapsed_str,
                     *start_process(),
                 )
                 continue
 
-            rel_path = Path(media_path).relative_to(folder_path)
-            name_md = f"**File:** `{rel_path}`"
-            media_to_show = Image.open(media_path) if is_image_file(media_path) else None
-            elapsed_str = _format_elapsed_str(start_time)
-            percent = int(((idx + 1) / total_media) * 100)
-            last_media_to_show = media_to_show
-            last_caption = caption
-            last_name_md = name_md
-            processed_media += 1
-            logger.info(
-                "[%d/%d %3d%%] captioned %s (elapsed %s)",
-                idx + 1, total_media, percent, rel_path, elapsed_str,
-            )
-            yield (
-                f"🖼️ Processing {idx + 1}/{total_media}: {rel_path}",
-                media_to_show,
-                name_md,
-                caption,
-                percent,
-                elapsed_str,
-                *start_process(),
-            )
+            # kind == "batch"
+            _, indices, paths, future = item
+            captions, _n, err = _resolve_batch(future, max_tokens)
+            if err is not None:
+                failed_media += len(indices)
+                for idx, media_path in zip(indices, paths):
+                    rel_path = Path(media_path).relative_to(folder_path)
+                    logger.error(
+                        "[%d/%d] error processing %s: %s",
+                        idx + 1, total_media, rel_path, err,
+                    )
+                    yield (
+                        f"⚠️ Error processing {media_path}: {err}",
+                        None,
+                        None,
+                        "Error in captioning.",
+                        0,
+                        elapsed_str,
+                        *start_process(),
+                    )
+                continue
 
-    total_elapsed = monotonic() - start_time
-    avg = total_elapsed / processed_media if processed_media else 0.0
-    logger.info(
-        "processing complete: processed=%d skipped=%d failed=%d total=%.3fs avg=%.3fs/media",
-        processed_media, skipped_media, failed_media, total_elapsed, avg,
-    )
-    yield (
-        "✅ Processing complete!"
-        f"processed {processed_media} media in {elapsed_str}, skipped {skipped_media} media."
-        f"Failed to process {failed_media} media (inaccessible, unknown or broken file)",
-        last_media_to_show,
-        last_name_md,
-        last_caption,
-        None,
-        None,
-        *finish_process(),
-    )
+            for idx, media_path, caption in zip(indices, paths, captions):
+                try:
+                    with open(_caption_path_for(media_path, caption_extension), "w", encoding="utf-8") as f:
+                        f.write(caption)
+                except OSError as e:
+                    rel_path = Path(media_path).relative_to(folder_path)
+                    logger.exception(
+                        "[%d/%d] write failed for %s",
+                        idx + 1, total_media, rel_path,
+                    )
+                    failed_media += 1
+                    yield (
+                        f"⚠️ Error writing {media_path}: {e}",
+                        None,
+                        None,
+                        "Error in captioning.",
+                        0,
+                        elapsed_str,
+                        *start_process(),
+                    )
+                    continue
+
+                rel_path = Path(media_path).relative_to(folder_path)
+                name_md = f"**File:** `{rel_path}`"
+                media_to_show = Image.open(media_path) if is_image_file(media_path) else None
+                elapsed_str = _format_elapsed_str(start_time)
+                percent = int(((idx + 1) / total_media) * 100)
+                last_media_to_show = media_to_show
+                last_caption = caption
+                last_name_md = name_md
+                processed_media += 1
+                logger.info(
+                    "[%d/%d %3d%%] captioned %s (elapsed %s)",
+                    idx + 1, total_media, percent, rel_path, elapsed_str,
+                )
+                yield (
+                    f"🖼️ Processing {idx + 1}/{total_media}: {rel_path}",
+                    media_to_show,
+                    name_md,
+                    caption,
+                    percent,
+                    elapsed_str,
+                    *start_process(),
+                )
+
+        completed_action = "complete"
+        yield (
+            "✅ Processing complete!"
+            f"processed {processed_media} media in {elapsed_str}, skipped {skipped_media} media."
+            f"Failed to process {failed_media} media (inaccessible, unknown or broken file)",
+            last_media_to_show,
+            last_name_md,
+            last_caption,
+            None,
+            None,
+            *finish_process(),
+        )
+    finally:
+        _log_run_summary(completed_action, processed_media, skipped_media, failed_media, start_time)
 
 
 def process_folder(
