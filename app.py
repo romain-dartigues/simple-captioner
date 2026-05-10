@@ -2,11 +2,11 @@
 import re
 from concurrent.futures import Future, ThreadPoolExecutor
 from logging import basicConfig, getLogger
+from os import cpu_count
 from pathlib import Path
 from queue import Empty, Full, Queue
-from os import cpu_count
-from time import monotonic
 from threading import Event, Thread
+from time import monotonic
 from typing import Any, cast
 
 # dependencies
@@ -257,8 +257,6 @@ control_keys = [
     "skip_existing_checkbox",
     "caption_extension",
     "max_tokens_slider",
-    "summary_mode",
-    "one_sentence_mode",
     "retain_preview_checkbox",
     "resolution_mode",
     "batch_size_slider",
@@ -348,16 +346,6 @@ def suggest_batch_size() -> int:
 logger.debug("CUDA availability: %s", torch.cuda.is_available())
 
 
-def _augment_prompt(prompt: str, summary_mode: bool, one_sentence_mode: bool) -> str:
-    if summary_mode and one_sentence_mode:
-        return prompt + " Give a one-sentence summary of the scene."
-    if summary_mode:
-        return prompt + " Give a short summary of the scene."
-    if one_sentence_mode:
-        return prompt + " Describe this image in one sentence."
-    return prompt
-
-
 def _resolution_kwargs(resolution_mode: str) -> dict[str, int]:
     if resolution_mode == "auto":
         return {"min_pixels": 256 * 28 * 28, "max_pixels": 896 * 28 * 28}
@@ -373,8 +361,6 @@ def _resolution_kwargs(resolution_mode: str) -> dict[str, int]:
 def _build_messages(
     media_path: str,
     prompt: str,
-    summary_mode: bool,
-    one_sentence_mode: bool,
     resolution_mode: str,
 ) -> list[dict[str, Any]]:
     is_video = is_video_file(media_path)
@@ -383,29 +369,22 @@ def _build_messages(
     content_block: dict[str, Any] = {"type": content_type, content_type: media_data}
     if not is_video:
         content_block.update(_resolution_kwargs(resolution_mode))
-    user_text = _augment_prompt(prompt, summary_mode, one_sentence_mode)
-    messages: list[dict[str, Any]] = [{"role": "user", "content": [content_block, {"type": "text", "text": user_text}]}]
+    messages: list[dict[str, Any]] = [{"role": "user", "content": [content_block, {"type": "text", "text": prompt}]}]
     if is_qwen35_model(current_model_id):
         messages.append({"role": "assistant", "content": "<think>\n\n</think>\n\n"})
     return messages
 
 
-def _preprocess_batch_joycaption(
-    media_paths: list[str],
-    prompt: str,
-    summary_mode: bool,
-    one_sentence_mode: bool,
-):
+def _preprocess_batch_joycaption(media_paths: list[str], prompt: str):
     """JoyCaption (LLaVA) preprocessing: hard-coded system prompt, the
     user-facing prompt drives the user turn, image is passed separately to
     the processor (no qwen_vl_utils, no resolution kwargs — the LLaVA image
     processor handles sizing internally). Image-only — videos are rejected."""
     global processor
     assert processor is not None
-    user_text = _augment_prompt(prompt, summary_mode, one_sentence_mode)
     messages = [
         {"role": "system", "content": JOYCAPTION_SYSTEM_PROMPT},
-        {"role": "user", "content": user_text},
+        {"role": "user", "content": prompt},
     ]
     convo_string = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     images: list[Image.Image] = []
@@ -424,8 +403,6 @@ def _preprocess_batch_joycaption(
 def preprocess_batch(
     media_paths: list[str],
     prompt: str,
-    summary_mode: bool = False,
-    one_sentence_mode: bool = False,
     resolution_mode: str = "auto",
 ):
     """Build a BatchFeature with batch dim len(media_paths) on CPU.
@@ -437,13 +414,13 @@ def preprocess_batch(
     if not media_paths:
         raise ValueError("preprocess_batch requires at least one media path")
     if is_joycaption_model(current_model_id):
-        return _preprocess_batch_joycaption(media_paths, prompt, summary_mode, one_sentence_mode)
+        return _preprocess_batch_joycaption(media_paths, prompt)
     qwen35 = is_qwen35_model(current_model_id)
     texts: list[str] = []
     images_acc: list[Any] = []
     videos_acc: list[Any] = []
     for path in media_paths:
-        messages = _build_messages(path, prompt, summary_mode, one_sentence_mode, resolution_mode)
+        messages = _build_messages(path, prompt, resolution_mode)
         texts.append(
             processor.apply_chat_template(
                 messages,
@@ -466,16 +443,10 @@ def preprocess_batch(
     )
 
 
-def preprocess_one(
-    media_path: str,
-    prompt: str,
-    summary_mode: bool = False,
-    one_sentence_mode: bool = False,
-    resolution_mode: str = "auto",
-):
+def preprocess_one(media_path: str, prompt: str, resolution_mode: str = "auto"):
     """Single-sample wrapper around preprocess_batch. Safe to call from
     worker threads while the GPU is busy (touches only the processor)."""
-    return preprocess_batch([media_path], prompt, summary_mode, one_sentence_mode, resolution_mode)
+    return preprocess_batch([media_path], prompt, resolution_mode)
 
 
 def _generation_kwargs(model_id: str, max_tokens: int) -> dict[str, Any]:
@@ -541,18 +512,11 @@ def decode_one(generated_ids, input_ids) -> str:
     return decode_batch(generated_ids, input_ids)[0]
 
 
-def generate_caption(
-    media_path,
-    prompt,
-    max_tokens,
-    summary_mode=False,
-    one_sentence_mode=False,
-    resolution_mode="auto",
-):
+def generate_caption(media_path, prompt, max_tokens, resolution_mode="auto"):
     """Single-sample orchestrator preserved for back-compat with callers
     that don't yet use the prefetched/batched pipeline."""
     t_start = monotonic()
-    inputs = preprocess_one(media_path, prompt, summary_mode, one_sentence_mode, resolution_mode)
+    inputs = preprocess_one(media_path, prompt, resolution_mode)
     t_prep_end = monotonic()
     generated_ids, input_ids = run_generate(inputs, max_tokens)
     t_gen_end = monotonic()
@@ -577,15 +541,6 @@ def is_image_file(filename):
 
 def is_video_file(filename):
     return filename.lower().endswith(VIDEO_EXTENSIONS)
-
-
-def build_final_prompt(user_prompt, summary, one_sentence):
-    parts = [user_prompt.strip()]
-    if summary:
-        parts.append("Please provide a short summary.")
-    if one_sentence:
-        parts.append("Keep the description to one sentence.")
-    return " ".join(parts)
 
 
 def _format_elapsed_str(start_time: float) -> str:
@@ -618,8 +573,6 @@ def _prefetch_dispatcher(
     media_files: list[str],
     batch_size: int,
     prompt: str,
-    summary_mode: bool,
-    one_sentence_mode: bool,
     resolution_mode: str,
     skip_existing: bool,
     caption_extension: str,
@@ -661,8 +614,6 @@ def _prefetch_dispatcher(
                     preprocess_batch,
                     paths,
                     prompt,
-                    summary_mode,
-                    one_sentence_mode,
                     resolution_mode,
                 )
             except RuntimeError:
@@ -838,8 +789,6 @@ def process_folder(
     skip_existing,
     caption_extension,
     max_tokens,
-    summary_mode,
-    one_sentence_mode,
     retain_preview,
     resolution_mode,
     batch_size,
@@ -851,7 +800,7 @@ def process_folder(
 
     logger.debug(
         "starting folder processing: model=%s quant=%s folder=%s skip_existing=%s "
-        "caption_extension=%s max_tokens=%s summary=%s one_sentence=%s retain_preview=%s "
+        "caption_extension=%s max_tokens=%s retain_preview=%s "
         "resolution=%s batch_size=%s prefetch_workers=%s should_abort=%s",
         current_model_id,
         current_quant,
@@ -859,8 +808,6 @@ def process_folder(
         skip_existing,
         caption_extension,
         max_tokens,
-        summary_mode,
-        one_sentence_mode,
         retain_preview,
         resolution_mode,
         batch_size,
@@ -911,8 +858,6 @@ def process_folder(
             "media_files": media_files,
             "batch_size": batch_size,
             "prompt": prompt,
-            "summary_mode": summary_mode,
-            "one_sentence_mode": one_sentence_mode,
             "resolution_mode": resolution_mode,
             "skip_existing": skip_existing,
             "caption_extension": caption_extension,
@@ -1021,17 +966,6 @@ with gradio.Blocks() as iface:  # type: ignore
         )
 
     with gradio.Row():
-        gradio.Markdown("### Prompt Controls")
-        gradio.Markdown("""
-        - **Summary Mode**: Asks the model to summarize the media content briefly.
-        - **One-Sentence Mode**: Instructs the model to keep the caption to a single concise sentence.
-        """)
-        ui_e["summary_mode"] = gradio.Checkbox(label="Summary Mode", value=False)
-        ui_e["one_sentence_mode"] = gradio.Checkbox(label="One-Sentence Mode", value=False)
-
-    prompt_preview = gradio.Textbox(label="Final Prompt Preview", lines=2, interactive=False)
-
-    with gradio.Row():
         ui_e["max_tokens_slider"] = gradio.Slider(
             label="🧾 Max Tokens", minimum=32, maximum=1024 * 8, value=DEFAULT_MAX_TOKENS, step=16
         )
@@ -1085,24 +1019,6 @@ with gradio.Blocks() as iface:  # type: ignore
         with gradio.Column(scale=1):
             caption_output = gradio.Textbox(label="Generated Caption", interactive=False)
 
-    ui_e["prompt_input"].change(
-        fn=build_final_prompt,
-        inputs=[ui_e["prompt_input"], ui_e["summary_mode"], ui_e["one_sentence_mode"]],
-        outputs=[prompt_preview],
-    )
-
-    ui_e["summary_mode"].change(
-        fn=build_final_prompt,
-        inputs=[ui_e["prompt_input"], ui_e["summary_mode"], ui_e["one_sentence_mode"]],
-        outputs=[prompt_preview],
-    )
-
-    ui_e["one_sentence_mode"].change(
-        fn=build_final_prompt,
-        inputs=[ui_e["prompt_input"], ui_e["summary_mode"], ui_e["one_sentence_mode"]],
-        outputs=[prompt_preview],
-    )
-
     ui_e["start_button"].click(start_process, inputs=[], outputs=[ui_e[k] for k in control_keys])
 
     ui_e["start_button"].click(
@@ -1113,8 +1029,6 @@ with gradio.Blocks() as iface:  # type: ignore
             ui_e["skip_existing_checkbox"],
             ui_e["caption_extension"],
             ui_e["max_tokens_slider"],
-            ui_e["summary_mode"],
-            ui_e["one_sentence_mode"],
             ui_e["retain_preview_checkbox"],
             ui_e["resolution_mode"],
             ui_e["batch_size_slider"],
