@@ -116,7 +116,7 @@ Forgetting step 2 causes silent UI drift (wrong components get enabled/disabled)
 
 ### Output convention
 
-For each input file `foo.jpg`, the caption is written as `foo.txt` next to it (via `_txt_path_for`). `skip_existing` checks for that `.txt` before invoking the model. Subfolders are walked recursively via `os.walk`.
+For each input file `foo.jpg`, the caption is written as `foo.<ext>` next to it (via `_caption_path_for`). The extension is taken from the **Caption File Extension** UI textbox (default `txt`); the user enters it without the leading dot, and `_sanitize_caption_extension()` strips stray dots/whitespace and falls back to `txt` if empty. `skip_existing` checks for the file at that exact extension before invoking the model — switching extensions effectively re-captions everything because the old `.txt` files no longer count as "already captioned". Subfolders are walked recursively via `os.walk`.
 
 ## Style
 

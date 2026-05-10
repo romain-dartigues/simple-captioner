@@ -15,13 +15,14 @@ from PIL import Image
 from qwen_vl_utils import process_vision_info
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import SpecificPreTrainedModelType
-from transformers.models.auto.modeling_auto import AutoModelForImageTextToText, AutoModelForCausalLM
+from transformers.models.auto.modeling_auto import AutoModelForCausalLM, AutoModelForImageTextToText
 from transformers.models.auto.processing_auto import AutoProcessor
 from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
 from transformers.processing_utils import ProcessorMixin
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.utils.quantization_config import BitsAndBytesConfig
 
 logger = getLogger(__name__)
@@ -62,7 +63,8 @@ AVAILABLE_MODELS = [
     "Qwen/Qwen3-VL-8B-Instruct",
     "Qwen/Qwen2.5-VL-3B-Instruct",
     "Qwen/Qwen2.5-VL-7B-Instruct",
-    # Fastest and lightest. Good for rough captions, OCR, dense regions, and prepasses; weaker for rich uncensored natural-language captions.
+    # Fastest and lightest. Good for rough captions, OCR, dense regions, and prepasses;
+    # weaker for rich uncensored natural-language captions.
     "microsoft/Florence-2-large",
     "microsoft/Florence-2-large-ft",
     # JoyCaption Beta One (LLaVA: Llama 3.1 8B + SigLIP). Pick 4-bit quant
@@ -78,7 +80,7 @@ AVAILABLE_MODELS = [
 
 
 # Globals
-processor = None
+processor: ProcessorMixin | None = None
 current_model_id = DEFAULT_MODEL_ID
 current_quant = DEFAULT_QUANT
 model = None
@@ -156,7 +158,7 @@ def _configure_tokenizer_for_batching(processor_obj, model_obj) -> None:
        fall back with a warning. No-op for Qwen-family tokenizers that
        already have a pad_token.
     """
-    tokenizer = getattr(processor_obj, "tokenizer", None)
+    tokenizer: PreTrainedTokenizerBase | None = getattr(processor_obj, "tokenizer", None)
     if tokenizer is None:
         return
     if getattr(tokenizer, "padding_side", None) is not None:
@@ -252,6 +254,7 @@ control_keys = [
     "folder_input",
     "prompt_input",
     "skip_existing_checkbox",
+    "caption_extension",
     "max_tokens_slider",
     "summary_mode",
     "one_sentence_mode",
@@ -396,6 +399,7 @@ def _preprocess_batch_joycaption(
     user-facing prompt drives the user turn, image is passed separately to
     the processor (no qwen_vl_utils, no resolution kwargs — the LLaVA image
     processor handles sizing internally). Image-only — videos are rejected."""
+    global processor
     assert processor is not None
     user_text = _augment_prompt(prompt, summary_mode, one_sentence_mode)
     messages = [
@@ -429,7 +433,6 @@ def preprocess_batch(
     image across the flat list, so order matters."""
     global processor
     assert processor is not None, "Processor must be loaded before preprocessing."
-    processor = cast(ProcessorMixin, processor)
     if not media_paths:
         raise ValueError("preprocess_batch requires at least one media path")
     if is_joycaption_model(current_model_id):
@@ -521,7 +524,6 @@ def decode_batch(generated_ids, input_ids) -> list[str]:
     stripping Qwen3.5 think tags when present."""
     global processor
     assert processor is not None, "Processor must be loaded before decoding."
-    processor = cast(ProcessorMixin, processor)
     trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(input_ids, generated_ids)]
     captions = processor.batch_decode(
         trimmed,
@@ -590,10 +592,16 @@ def _format_elapsed_str(start_time: float) -> str:
     return f"{elapsed // 60:02d}:{elapsed % 60:02d}"
 
 
-def _txt_path_for(media_path: str) -> str:
+def _sanitize_caption_extension(ext: str) -> str:
+    """Strip leading dots and whitespace; fall back to 'txt' if empty."""
+    cleaned = (ext or "").strip().lstrip(".").strip()
+    return cleaned or "txt"
+
+
+def _caption_path_for(media_path: str, extension: str = "txt") -> str:
     return os.path.join(
         os.path.dirname(media_path),
-        os.path.splitext(os.path.basename(media_path))[0] + ".txt",
+        os.path.splitext(os.path.basename(media_path))[0] + "." + extension,
     )
 
 
@@ -616,6 +624,7 @@ def _prefetch_dispatcher(
     one_sentence_mode: bool,
     resolution_mode: str,
     skip_existing: bool,
+    caption_extension: str,
     executor: ThreadPoolExecutor,
     out_queue: Queue,
     cancel: threading.Event,
@@ -634,7 +643,7 @@ def _prefetch_dispatcher(
             if should_abort or cancel.is_set():
                 return
             path_i = media_files[i]
-            if skip_existing and os.path.exists(_txt_path_for(path_i)):
+            if skip_existing and os.path.exists(_caption_path_for(path_i, caption_extension)):
                 if not _put_until_cancel(out_queue, ("skip", i, path_i, None), cancel):
                     return
                 i += 1
@@ -644,7 +653,7 @@ def _prefetch_dispatcher(
             j = i + 1
             while j < n and len(indices) < batch_size:
                 pj = media_files[j]
-                if skip_existing and os.path.exists(_txt_path_for(pj)):
+                if skip_existing and os.path.exists(_caption_path_for(pj, caption_extension)):
                     break
                 indices.append(j)
                 paths.append(pj)
@@ -706,7 +715,9 @@ def _resolve_batch(future: Future, max_tokens: int):
         return None, 0, e
 
 
-def _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefetch_queue, start_time):
+def _captioning_loop(
+    folder_path, total_media, max_tokens, retain_preview, caption_extension, prefetch_queue, start_time
+):
     """Consumer side of the prefetch pipeline. Yields Gradio update tuples.
     Reads `should_abort` (and resets it on consumption) so the abort
     button works mid-loop. Emits the final summary on clean completion;
@@ -770,7 +781,7 @@ def _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefe
 
         for idx, media_path, caption in zip(indices, paths, captions):
             try:
-                with open(_txt_path_for(media_path), "w", encoding="utf-8") as f:
+                with open(_caption_path_for(media_path, caption_extension), "w", encoding="utf-8") as f:
                     f.write(caption)
             except OSError as e:
                 logger.exception("Write failed for %s", media_path)
@@ -827,6 +838,7 @@ def process_folder(
     folder_path,
     prompt,
     skip_existing,
+    caption_extension,
     max_tokens,
     summary_mode,
     one_sentence_mode,
@@ -837,15 +849,17 @@ def process_folder(
 ):
     batch_size = max(1, int(batch_size))
     prefetch_workers = max(1, int(prefetch_workers))
+    caption_extension = _sanitize_caption_extension(caption_extension)
 
     logger.debug(
         "starting folder processing: model=%s quant=%s folder=%s skip_existing=%s "
-        "max_tokens=%s summary=%s one_sentence=%s retain_preview=%s resolution=%s "
-        "batch_size=%s prefetch_workers=%s should_abort=%s",
+        "caption_extension=%s max_tokens=%s summary=%s one_sentence=%s retain_preview=%s "
+        "resolution=%s batch_size=%s prefetch_workers=%s should_abort=%s",
         current_model_id,
         current_quant,
         folder_path,
         skip_existing,
+        caption_extension,
         max_tokens,
         summary_mode,
         one_sentence_mode,
@@ -903,6 +917,7 @@ def process_folder(
             "one_sentence_mode": one_sentence_mode,
             "resolution_mode": resolution_mode,
             "skip_existing": skip_existing,
+            "caption_extension": caption_extension,
             "executor": executor,
             "out_queue": prefetch_queue,
             "cancel": cancel,
@@ -911,7 +926,9 @@ def process_folder(
     dispatcher.start()
 
     try:
-        yield from _captioning_loop(folder_path, total_media, max_tokens, retain_preview, prefetch_queue, start_time)
+        yield from _captioning_loop(
+            folder_path, total_media, max_tokens, retain_preview, caption_extension, prefetch_queue, start_time
+        )
     finally:
         cancel.set()
         # Drain so a dispatcher blocked on .put(...) can wake.
@@ -997,7 +1014,15 @@ with gradio.Blocks() as iface:  # type: ignore
         )
         ui_e["prompt_input"] = gradio.Textbox(label="Custom Prompt", value=DEFAULT_PROMPT)
 
-    ui_e["skip_existing_checkbox"] = gradio.Checkbox(label="Skip already captioned media (.txt exists)", value=True)
+    with gradio.Row():
+        ui_e["skip_existing_checkbox"] = gradio.Checkbox(
+            label="Skip already captioned media (caption file exists)", value=True
+        )
+        ui_e["caption_extension"] = gradio.Textbox(
+            label="Caption File Extension",
+            value="txt",
+            info="Extension for the generated caption files, without the leading dot. e.g. 'txt', 'cap'.",
+        )
 
     with gradio.Row():
         gradio.Markdown("### Prompt Controls")
@@ -1090,6 +1115,7 @@ with gradio.Blocks() as iface:  # type: ignore
             ui_e["folder_input"],
             ui_e["prompt_input"],
             ui_e["skip_existing_checkbox"],
+            ui_e["caption_extension"],
             ui_e["max_tokens_slider"],
             ui_e["summary_mode"],
             ui_e["one_sentence_mode"],
