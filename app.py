@@ -827,10 +827,10 @@ def process_folder(
     prefetch_workers = max(1, int(prefetch_workers))
     caption_extension = _sanitize_caption_extension(caption_extension)
 
-    logger.debug(
+    logger.info(
         "starting folder processing: model=%s quant=%s folder=%s skip_existing=%s "
         "caption_extension=%s max_tokens=%s retain_preview=%s "
-        "resolution=%s batch_size=%s prefetch_workers=%s should_abort=%s",
+        "resolution=%s batch_size=%s prefetch_workers=%s should_abort=%s prompt=%r",
         current_model_id,
         current_quant,
         folder_path,
@@ -842,6 +842,7 @@ def process_folder(
         batch_size,
         prefetch_workers,
         should_abort,
+        prompt,
     )
 
     if not folder_path.strip():
