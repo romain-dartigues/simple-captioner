@@ -1,8 +1,14 @@
+"""
+Dependencies are slow to load, especially qwen, torch and transformers;
+moved the minimal required dependencies to common
+"""
+
 # stdlib
 import re
+from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from logging import basicConfig, getLogger
-from os import cpu_count
+from dataclasses import dataclass
+from logging import getLogger
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Thread
@@ -10,7 +16,6 @@ from time import monotonic
 from typing import Any, cast
 
 # dependencies
-import gradio
 import torch
 from PIL import Image
 from qwen_vl_utils import process_vision_info
@@ -26,67 +31,79 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.utils.quantization_config import BitsAndBytesConfig
 
+# project
+from .common import (
+    DEFAULT_ATTN,
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_MODEL_ID,
+    DEFAULT_PREFETCH_WORKERS,
+    DEFAULT_QUANT,
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    abort_event,
+)
+
 logger = getLogger(__name__)
 
 r_caption = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
-IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
-VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".webm", ".mkv", ".gif", ".flv")
-DEFAULT_PROMPT = (
-    "In a concise way, describe this media, it's background, "
-    "composition, lighting, camera, lens, style, ambiance, "
-    "people, emotions, acts, racial traits, physical features, clothes, positions, "
-    "objects, animals, fauna, flora, etc."
-)
-DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
-DEFAULT_QUANT = "8-bit"  # "None" | "8-bit" | "4-bit"
-DEFAULT_ATTN = "eager"
-DEFAULT_MAX_TOKENS = 2048
-
 JOYCAPTION_SYSTEM_PROMPT = "You are a helpful image captioner."
 
-# Default sliders. batch_size starts at 1 (safe on any VRAM); a future
-# commit may bump it after model load based on free VRAM.
-# prefetch_workers default scales with the host CPU count but stays
-# modest because preprocessing is much cheaper than GPU generation —
-# extra workers mostly help once batch_size is high enough that the
-# processor's per-batch CPU cost rivals model.generate.
-DEFAULT_BATCH_SIZE = 1
-DEFAULT_PREFETCH_WORKERS = max(1, min(4, (cpu_count() or 2) // 2))
-MAX_BATCH_SIZE = 16
-MAX_PREFETCH_WORKERS = 8
 
-
-AVAILABLE_MODELS = [
-    "Qwen/Qwen3.5-4B",
-    "Qwen/Qwen3.5-9B",
-    "Qwen/Qwen3-VL-4B-Instruct",
-    "Qwen/Qwen3-VL-8B-Instruct",
-    "Qwen/Qwen2.5-VL-3B-Instruct",
-    "Qwen/Qwen2.5-VL-7B-Instruct",
-    # Fastest and lightest. Good for rough captions, OCR, dense regions, and prepasses;
-    # weaker for rich uncensored natural-language captions.
-    "microsoft/Florence-2-large",
-    "microsoft/Florence-2-large-ft",
-    # JoyCaption Beta One (LLaVA: Llama 3.1 8B + SigLIP). Pick 4-bit quant
-    # for 12 GB GPUs (~6 GB resident); 8-bit fits but is tight (~10 GB).
-    # The pre-quantized `heavlav/...-4bit` mirror is intentionally NOT listed:
-    # its vision tower is bnb-quantized and crashes inside SigLIP's
-    # nn.MultiheadAttention (Byte vs BFloat16 dtype mismatch). Loading the
-    # un-quantized fancyfeast checkpoint here lets us skip the vision tower
-    # from quantization at load time, which sidesteps the bug.
-    "fancyfeast/llama-joycaption-beta-one-hf-llava",
-    "Custom...",
-]
-
-
-# Globals
+# Module-level mutable state. Rebound via load_selected_model /
+# unload_model; consumed by preprocess_batch / run_generate /
+# decode_batch. The Gradio UI handlers and the CLI both share this
+# state — there is only ever one loaded model per process.
 processor: ProcessorMixin | None = None
 current_model_id = DEFAULT_MODEL_ID
 current_quant = DEFAULT_QUANT
 model = None
-should_abort = False
-ui_e = {}
+
+
+@dataclass(frozen=True, kw_only=True)
+class BaseEvent:
+    """Fields common to every event yielded by caption_folder().
+    kw_only=True keeps subclass fields positional-friendly: the inherited
+    `total` / `elapsed_s` must always be passed as keywords, so subclasses
+    are free to declare their own fields without colliding with the base
+    field order."""
+
+    total: int
+    elapsed_s: float
+
+
+@dataclass(frozen=True, kw_only=True)
+class SkipEvent(BaseEvent):
+    idx: int
+    path: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class CaptionedEvent(BaseEvent):
+    idx: int
+    path: str
+    caption: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class ErrorEvent(BaseEvent):
+    idx: int
+    path: str
+    error: BaseException
+
+
+@dataclass(frozen=True, kw_only=True)
+class CompleteEvent(BaseEvent):
+    processed: int
+    skipped: int
+    failed: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class AbortedEvent(BaseEvent):
+    processed: int
+    skipped: int
+    failed: int
 
 
 def preferred_compute_dtype():
@@ -223,81 +240,6 @@ def load_selected_model(model_id: str, quant_choice: str, attn_impl: str = DEFAU
     current_model_id = model_id
     current_quant = quant_choice
     return get_model_info()
-
-
-def toggle_controls(disabled=True):
-    updates = {}
-    for name, component in ui_e.items():
-        if name == "abort_button":
-            updates[name] = gradio.update(interactive=not disabled)
-        else:
-            updates[name] = gradio.update(interactive=not disabled if component.visible else False)
-    return updates
-
-
-def disable_controls_dict():
-    return [toggle_controls(disabled=True)[k] for k in control_keys]
-
-
-def enable_controls_dict():
-    return [toggle_controls(disabled=False)[k] for k in control_keys]
-
-
-control_keys = [
-    "model_dropdown",
-    "quant_dropdown",
-    "attn_dropdown",
-    "load_button",
-    "reset_button",
-    "start_button",
-    "abort_button",
-    "folder_input",
-    "prompt_input",
-    "skip_existing_checkbox",
-    "caption_extension",
-    "max_tokens_slider",
-    "retain_preview_checkbox",
-    "resolution_mode",
-    "batch_size_slider",
-    "prefetch_workers_slider",
-    "status_output",
-]
-
-
-def finish_process():
-    updates = enable_controls_dict()
-    abort_index = control_keys.index("abort_button")
-    updates[abort_index] = gradio.update(interactive=False)
-    return updates
-
-
-def abort_process():
-    global should_abort
-    should_abort = True
-    updates = enable_controls_dict()
-    abort_index = control_keys.index("abort_button")
-    status_index = control_keys.index("status_output")
-    updates[abort_index] = gradio.update(interactive=False)
-    updates[status_index] = gradio.update(value="⛔ Aborting process...")
-    return updates
-
-
-def start_process():
-    updates = disable_controls_dict()
-    abort_index = control_keys.index("abort_button")
-    updates[abort_index] = gradio.update(interactive=True)
-    return updates
-
-
-def serialize_for_debug(obj):
-    if isinstance(obj, dict):
-        return {k: serialize_for_debug(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [serialize_for_debug(i) for i in obj]
-    elif isinstance(obj, Image.Image):
-        return f"<Image {obj.size} {obj.mode}>"
-    else:
-        return obj
 
 
 def get_model_info():
@@ -542,18 +484,19 @@ def is_video_file(filename):
     return filename.lower().endswith(VIDEO_EXTENSIONS)
 
 
-def _format_elapsed_str(start_time: float) -> str:
-    elapsed = int(monotonic() - start_time)
+def format_elapsed(elapsed_s: float) -> str:
+    """Format seconds as MM:SS for display in status lines."""
+    elapsed = int(elapsed_s)
     return f"{elapsed // 60:02d}:{elapsed % 60:02d}"
 
 
-def _sanitize_caption_extension(ext: str) -> str:
+def sanitize_caption_extension(ext: str) -> str:
     """Strip leading dots and whitespace; fall back to 'txt' if empty."""
     cleaned = (ext or "").strip().lstrip(".").strip()
     return cleaned or "txt"
 
 
-def _caption_path_for(media_path: str, extension: str = "txt") -> Path:
+def caption_path_for(media_path: str, extension: str = "txt") -> Path:
     return Path(media_path).with_suffix(f".{extension}")
 
 
@@ -590,10 +533,10 @@ def _prefetch_dispatcher(
         i = 0
         n = len(media_files)
         while i < n:
-            if should_abort or cancel.is_set():
+            if abort_event.is_set() or cancel.is_set():
                 return
             path_i = media_files[i]
-            if skip_existing and _caption_path_for(path_i, caption_extension).exists():
+            if skip_existing and caption_path_for(path_i, caption_extension).exists():
                 if not _put_until_cancel(out_queue, ("skip", i, path_i, None), cancel):
                     return
                 i += 1
@@ -603,7 +546,7 @@ def _prefetch_dispatcher(
             j = i + 1
             while j < n and len(indices) < batch_size:
                 pj = media_files[j]
-                if skip_existing and _caption_path_for(pj, caption_extension).exists():
+                if skip_existing and caption_path_for(pj, caption_extension).exists():
                     break
                 indices.append(j)
                 paths.append(pj)
@@ -627,15 +570,6 @@ def _prefetch_dispatcher(
             out_queue.put(None, timeout=0.25)
         except Full:
             pass
-
-
-def _build_abort_yield():
-    status_index = control_keys.index("status_output")
-    abort_index = control_keys.index("abort_button")
-    control_updates = enable_controls_dict()
-    control_updates[status_index] = gradio.update(value="⛔ Aborted by user.")
-    control_updates[abort_index] = gradio.update(interactive=False)
-    return "⛔ Aborted by user.", None, None, "Aborted.", 0, "", *control_updates
 
 
 def _resolve_batch(future: Future, max_tokens: int):
@@ -663,220 +597,137 @@ def _resolve_batch(future: Future, max_tokens: int):
         return None, 0, e
 
 
+def _consume_batch_item(
+    item: tuple,
+    total: int,
+    folder: Path,
+    caption_extension: str,
+    max_tokens: int,
+    start: float,
+) -> Iterator[BaseEvent]:
+    """Resolve one 'batch' queue item: await the preprocess Future, run
+    model.generate, write caption files, and yield one per-sample event
+    (CaptionedEvent on success, ErrorEvent on preprocess/generate/write
+    failure). The caller tallies events by type for the run stats."""
+    _, indices, paths, future = item
+    captions, _n, err = _resolve_batch(future, max_tokens)
+    if err is not None:
+        elapsed_s = monotonic() - start
+        for idx, media_path in zip(indices, paths):
+            rel_path = Path(media_path).relative_to(folder)
+            logger.error(
+                "[%d/%d] error processing %s: %s",
+                idx + 1,
+                total,
+                rel_path,
+                err,
+            )
+            yield ErrorEvent(total=total, elapsed_s=elapsed_s, idx=idx, path=media_path, error=err)
+        return
+
+    for idx, media_path, caption in zip(indices, paths, captions):
+        try:
+            with open(caption_path_for(media_path, caption_extension), "w", encoding="utf-8") as f:
+                f.write(caption)
+        except OSError as e:
+            rel_path = Path(media_path).relative_to(folder)
+            logger.exception(
+                "[%d/%d] write failed for %s",
+                idx + 1,
+                total,
+                rel_path,
+            )
+            yield ErrorEvent(total=total, elapsed_s=monotonic() - start, idx=idx, path=media_path, error=e)
+            continue
+
+        rel_path = Path(media_path).relative_to(folder)
+        elapsed_s = monotonic() - start
+        percent = int(((idx + 1) / total) * 100)
+        logger.info(
+            "[%d/%d %3d%%] captioned %s (elapsed %s)",
+            idx + 1,
+            total,
+            percent,
+            rel_path,
+            format_elapsed(elapsed_s),
+        )
+        yield CaptionedEvent(total=total, elapsed_s=elapsed_s, idx=idx, path=media_path, caption=caption)
+
+
 def _log_run_summary(action: str, processed: int, skipped: int, failed: int, start_time: float) -> None:
     total_elapsed = monotonic() - start_time
     avg = total_elapsed / processed if processed else 0.0
     logger.info(
         "processing %s: processed=%d skipped=%d failed=%d total=%.3fs avg=%.3fs/media",
-        action, processed, skipped, failed, total_elapsed, avg,
+        action,
+        processed,
+        skipped,
+        failed,
+        total_elapsed,
+        avg,
     )
 
 
-def _captioning_loop(
-    folder_path, total_media, max_tokens, retain_preview, caption_extension, prefetch_queue, start_time
-):
-    """Consumer side of the prefetch pipeline. Yields Gradio update tuples.
-    Reads `should_abort` (and resets it on consumption) so the abort
-    button works mid-loop. A `try/finally` guarantees the run-summary
-    log line always fires (clean completion, abort, or unexpected
-    exception) — `completed_action` records which path won so the log
-    label is accurate."""
-    global should_abort
-    processed_media = 0
-    skipped_media = 0
-    failed_media = 0
-    last_media_to_show = None
-    last_caption = ""
-    last_name_md = ""
-    elapsed_str = ""
-    completed_action = "interrupted"
+def caption_folder(  # noqa: C901  — coordinator: setup + consumer loop + teardown
+    folder_path: str,
+    prompt: str,
+    skip_existing: bool,
+    caption_extension: str,
+    max_tokens: int,
+    resolution_mode: str = "auto",
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    prefetch_workers: int = DEFAULT_PREFETCH_WORKERS,
+) -> Iterator[BaseEvent]:
+    """Caption every image/video under `folder_path`, writing each
+    caption next to its source file (sibling `.<caption_extension>`).
+    Yields one event per sample (SkipEvent / CaptionedEvent /
+    ErrorEvent) plus a terminal CompleteEvent or AbortedEvent.
 
-    try:
-        while True:
-            if should_abort:
-                should_abort = False
-                completed_action = "aborted"
-                yield _build_abort_yield()
-                return
+    Cooperative cancellation: another thread calls request_abort();
+    the in-flight batch finishes and the next iteration yields
+    AbortedEvent. The abort_event is cleared at the start of each
+    call, so leftover state from a previous run doesn't bleed in.
 
-            try:
-                item = prefetch_queue.get(timeout=0.25)
-            except Empty:
-                continue
-            if item is None:
-                break
-
-            kind = item[0]
-
-            if kind == "skip":
-                _, idx, media_path, _ = item
-                rel_path = Path(media_path).relative_to(folder_path)
-                skipped_media += 1
-                elapsed_str = _format_elapsed_str(start_time)
-                percent = int(((idx + 1) / total_media) * 100)
-                logger.info(
-                    "[%d/%d %3d%%] skipped %s (elapsed %s)",
-                    idx + 1, total_media, percent, rel_path, elapsed_str,
-                )
-                yield (
-                    f"⏭️ Skipped {idx + 1}/{total_media}: {rel_path} (already captioned)",
-                    last_media_to_show if retain_preview else None,
-                    last_name_md if retain_preview else None,
-                    last_caption if retain_preview else "Skipped (already captioned)",
-                    percent,
-                    elapsed_str,
-                    *start_process(),
-                )
-                continue
-
-            # kind == "batch"
-            _, indices, paths, future = item
-            captions, _n, err = _resolve_batch(future, max_tokens)
-            if err is not None:
-                failed_media += len(indices)
-                for idx, media_path in zip(indices, paths):
-                    rel_path = Path(media_path).relative_to(folder_path)
-                    logger.error(
-                        "[%d/%d] error processing %s: %s",
-                        idx + 1, total_media, rel_path, err,
-                    )
-                    yield (
-                        f"⚠️ Error processing {media_path}: {err}",
-                        None,
-                        None,
-                        "Error in captioning.",
-                        0,
-                        elapsed_str,
-                        *start_process(),
-                    )
-                continue
-
-            for idx, media_path, caption in zip(indices, paths, captions):
-                try:
-                    with open(_caption_path_for(media_path, caption_extension), "w", encoding="utf-8") as f:
-                        f.write(caption)
-                except OSError as e:
-                    rel_path = Path(media_path).relative_to(folder_path)
-                    logger.exception(
-                        "[%d/%d] write failed for %s",
-                        idx + 1, total_media, rel_path,
-                    )
-                    failed_media += 1
-                    yield (
-                        f"⚠️ Error writing {media_path}: {e}",
-                        None,
-                        None,
-                        "Error in captioning.",
-                        0,
-                        elapsed_str,
-                        *start_process(),
-                    )
-                    continue
-
-                rel_path = Path(media_path).relative_to(folder_path)
-                name_md = f"**File:** `{rel_path}`"
-                media_to_show = Image.open(media_path) if is_image_file(media_path) else None
-                elapsed_str = _format_elapsed_str(start_time)
-                percent = int(((idx + 1) / total_media) * 100)
-                last_media_to_show = media_to_show
-                last_caption = caption
-                last_name_md = name_md
-                processed_media += 1
-                logger.info(
-                    "[%d/%d %3d%%] captioned %s (elapsed %s)",
-                    idx + 1, total_media, percent, rel_path, elapsed_str,
-                )
-                yield (
-                    f"🖼️ Processing {idx + 1}/{total_media}: {rel_path}",
-                    media_to_show,
-                    name_md,
-                    caption,
-                    percent,
-                    elapsed_str,
-                    *start_process(),
-                )
-
-        completed_action = "complete"
-        yield (
-            "✅ Processing complete!"
-            f"processed {processed_media} media in {elapsed_str}, skipped {skipped_media} media."
-            f"Failed to process {failed_media} media (inaccessible, unknown or broken file)",
-            last_media_to_show,
-            last_name_md,
-            last_caption,
-            None,
-            None,
-            *finish_process(),
-        )
-    finally:
-        _log_run_summary(completed_action, processed_media, skipped_media, failed_media, start_time)
-
-
-def process_folder(
-    folder_path,
-    prompt,
-    skip_existing,
-    caption_extension,
-    max_tokens,
-    retain_preview,
-    resolution_mode,
-    batch_size,
-    prefetch_workers,
-):
+    Raises FileNotFoundError if `folder_path` doesn't exist (the
+    caller is expected to validate input). Raises if no model is
+    loaded — call load_selected_model() first."""
     batch_size = max(1, int(batch_size))
     prefetch_workers = max(1, int(prefetch_workers))
-    caption_extension = _sanitize_caption_extension(caption_extension)
+    caption_extension = sanitize_caption_extension(caption_extension)
+    abort_event.clear()
 
     logger.info(
         "starting folder processing: model=%s quant=%s folder=%s skip_existing=%s "
-        "caption_extension=%s max_tokens=%s retain_preview=%s "
-        "resolution=%s batch_size=%s prefetch_workers=%s should_abort=%s prompt=%r",
+        "caption_extension=%s max_tokens=%s resolution=%s batch_size=%s "
+        "prefetch_workers=%s prompt=%r",
         current_model_id,
         current_quant,
         folder_path,
         skip_existing,
         caption_extension,
         max_tokens,
-        retain_preview,
         resolution_mode,
         batch_size,
         prefetch_workers,
-        should_abort,
         prompt,
     )
 
-    if not folder_path.strip():
-        yield "⚠️ Please enter a valid folder path.", None, None, "No media to process.", 0, "", *finish_process()
-        return
-
     folder = Path(folder_path)
     if not folder.exists():
-        yield f"❌ Folder not found: {folder_path}", None, None, "No media to process.", 0, "", *finish_process()
-        return
+        raise FileNotFoundError(folder_path)
 
     media_files = [
-        str(p)
-        for p in folder.rglob("*")
-        if p.is_file() and (is_image_file(p.name) or is_video_file(p.name))
+        str(p) for p in folder.rglob("*") if p.is_file() and (is_image_file(p.name) or is_video_file(p.name))
     ]
-    total_media = len(media_files)
-    if not total_media:
-        yield (
-            "📂 No media found in the folder or subfolders.",
-            None,
-            None,
-            "No media to process.",
-            0,
-            "",
-            *finish_process(),
-        )
+    total = len(media_files)
+    start = monotonic()
+
+    if total == 0:
+        logger.info("no media found under %s", folder_path)
+        _log_run_summary("complete", 0, 0, 0, start)
+        yield CompleteEvent(total=0, elapsed_s=monotonic() - start, processed=0, skipped=0, failed=0)
         return
 
-    start_time = monotonic()
-
-    # Bound the in-flight Futures so we don't preprocess far ahead of
-    # the GPU. Total in-flight ≈ queue_size + workers (queue holds
-    # already-submitted, workers each may hold one running task).
     prefetch_queue: Queue = Queue(maxsize=max(2, prefetch_workers * 2))
     cancel = Event()
     executor = ThreadPoolExecutor(max_workers=prefetch_workers, thread_name_prefix="caption-prep")
@@ -898,9 +749,65 @@ def process_folder(
     )
     dispatcher.start()
 
+    processed = 0
+    skipped = 0
+    failed = 0
+    completed_action = "interrupted"
+
     try:
-        yield from _captioning_loop(
-            folder_path, total_media, max_tokens, retain_preview, caption_extension, prefetch_queue, start_time
+        while True:
+            if abort_event.is_set():
+                completed_action = "aborted"
+                yield AbortedEvent(
+                    total=total,
+                    elapsed_s=monotonic() - start,
+                    processed=processed,
+                    skipped=skipped,
+                    failed=failed,
+                )
+                return
+
+            try:
+                item = prefetch_queue.get(timeout=0.25)
+            except Empty:
+                continue
+            if item is None:
+                break
+
+            kind = item[0]
+
+            if kind == "skip":
+                _, idx, media_path, _ = item
+                rel_path = Path(media_path).relative_to(folder)
+                skipped += 1
+                elapsed_s = monotonic() - start
+                percent = int(((idx + 1) / total) * 100)
+                logger.info(
+                    "[%d/%d %3d%%] skipped %s (elapsed %s)",
+                    idx + 1,
+                    total,
+                    percent,
+                    rel_path,
+                    format_elapsed(elapsed_s),
+                )
+                yield SkipEvent(total=total, elapsed_s=elapsed_s, idx=idx, path=media_path)
+                continue
+
+            # kind == "batch"
+            for event in _consume_batch_item(item, total, folder, caption_extension, max_tokens, start):
+                if isinstance(event, CaptionedEvent):
+                    processed += 1
+                else:
+                    failed += 1
+                yield event
+
+        completed_action = "complete"
+        yield CompleteEvent(
+            total=total,
+            elapsed_s=monotonic() - start,
+            processed=processed,
+            skipped=skipped,
+            failed=failed,
         )
     finally:
         cancel.set()
@@ -914,220 +821,4 @@ def process_folder(
         # finish naturally. wait=False so we don't block the generator.
         executor.shutdown(wait=False, cancel_futures=True)
         dispatcher.join(timeout=2.0)
-
-
-basicConfig(
-    level="INFO",
-)
-logger.setLevel("DEBUG")
-
-with gradio.Blocks() as iface:  # type: ignore
-    gradio.Markdown("# Simple Captioner")
-    gradio.Markdown(
-        "A simple media caption generator for images and video using **[Qwen2.5/3/3.5 VL Instruct](https://huggingface.co/Qwen/)**"
-        "Written by [Olli S.](https://github.com/o-l-l-i)"
-    )
-
-    with gradio.Accordion("⚙️ Model Settings", open=True):
-        ui_e["model_dropdown"] = model_dropdown = gradio.Dropdown(
-            label="Model",
-            choices=AVAILABLE_MODELS,
-            value=DEFAULT_MODEL_ID,
-            allow_custom_value=True,
-            interactive=True,
-            info="Pick a model to use for captioning.",
-        )
-        custom_model_box = gradio.Textbox(
-            label="Custom Model ID (Hugging Face)",
-            placeholder="e.g. Qwen/Qwen3-VL-4B-Instruct or your-org/my-qwen3-checkpoint",
-            visible=False,
-        )
-        ui_e["quant_dropdown"] = quant_dropdown = gradio.Radio(
-            label="Quantization",
-            choices=["None", "8-bit", "4-bit"],
-            value=DEFAULT_QUANT,
-            interactive=True,
-            info="Lower-bit quantization reduces VRAM, may slightly affect quality.",
-        )
-        ui_e["attn_dropdown"] = attn_dropdown = gradio.Radio(
-            label="Attention Implementation",
-            choices=["flash_attention_2", "eager"],
-            value=DEFAULT_ATTN,
-            interactive=True,
-            info="If FlashAttention isn't installed/working, choose 'eager'. Auto-fallback on load.",
-        )
-        ui_e["load_button"] = gradio.Button("📦 Load / Reload Model")
-
-    def _toggle_custom(choice):
-        return gradio.update(visible=(choice == "Custom..."))
-
-    model_dropdown.change(_toggle_custom, inputs=[model_dropdown], outputs=[custom_model_box])
-
-    def _ui_load_model(sel, custom_id, quant, attn):
-        model_id = custom_id.strip() if sel == "Custom..." and custom_id and custom_id.strip() else sel
-        name, device, vram, dtype, cfg = load_selected_model(model_id, quant, attn)
-        suggested_bs = suggest_batch_size()
-        status = f"✅ Loaded '{model_id}' with {quant} quantization ({attn}). Suggested batch size: {suggested_bs}."
-        logger.debug("status: %s", status)
-        return status, name, device, vram, dtype, cfg, gradio.update(value=suggested_bs)
-
-    with gradio.Accordion("⚙️ Model Information", open=False):
-        model_name_display = gradio.Textbox(label="Model Name", interactive=False)
-        device_display = gradio.Textbox(label="Device", interactive=False)
-        vram_display = gradio.Textbox(label="VRAM Usage", interactive=False)
-        dtype_display = gradio.Textbox(label="Torch Dtype", interactive=False)
-        config_display = gradio.Textbox(label="Model Config", interactive=False, lines=4)
-
-    with gradio.Row():
-        ui_e["folder_input"] = gradio.Textbox(
-            label="📁 Folder Path",
-            placeholder=r"e.g. C:\Users\you\Pictures\input_images",
-        )
-        ui_e["prompt_input"] = gradio.Textbox(label="Custom Prompt", value=DEFAULT_PROMPT)
-
-    with gradio.Row():
-        ui_e["skip_existing_checkbox"] = gradio.Checkbox(
-            label="Skip already captioned media (caption file exists)", value=True
-        )
-        ui_e["caption_extension"] = gradio.Textbox(
-            label="Caption File Extension",
-            value="txt",
-            info="Extension for the generated caption files, without the leading dot. e.g. 'txt', 'cap'.",
-        )
-
-    with gradio.Row():
-        ui_e["max_tokens_slider"] = gradio.Slider(
-            label="🧾 Max Tokens", minimum=32, maximum=1024 * 8, value=DEFAULT_MAX_TOKENS, step=16
-        )
-        ui_e["resolution_mode"] = gradio.Dropdown(
-            label="Image Resolution",
-            choices=["auto", "auto_high", "fast", "high"],
-            value="auto",
-            info="Choose the resolution mode for visual input.",
-        )
-
-    with gradio.Row():
-        ui_e["batch_size_slider"] = gradio.Slider(
-            label="📦 Batch Size",
-            minimum=1,
-            maximum=MAX_BATCH_SIZE,
-            value=DEFAULT_BATCH_SIZE,
-            step=1,
-            info=(
-                "Samples per model.generate() call. Higher = better GPU utilization, "
-                "but VRAM scales roughly linearly. Start at 1 and raise until VRAM "
-                "headroom shrinks."
-            ),
-        )
-        ui_e["prefetch_workers_slider"] = gradio.Slider(
-            label="🧵 Prefetch Workers",
-            minimum=1,
-            maximum=MAX_PREFETCH_WORKERS,
-            value=DEFAULT_PREFETCH_WORKERS,
-            step=1,
-            info=(
-                f"CPU threads preprocessing batches ahead of the GPU. "
-                f"Default {DEFAULT_PREFETCH_WORKERS} guessed from "
-                f"cpu_count={cpu_count() or '?'}."
-            ),
-        )
-
-    with gradio.Row():
-        ui_e["reset_button"] = gradio.Button("🔄 Reset to Default Prompt")
-        ui_e["start_button"] = gradio.Button("🚀 Start Processing", interactive=True)
-        ui_e["abort_button"] = gradio.Button("⛔ Abort", interactive=False)
-
-    ui_e["status_output"] = gradio.Textbox(label="Status", interactive=False)
-    progress_bar = gradio.Slider(minimum=0, maximum=100, label="Progress", interactive=False)
-    time_display = gradio.Textbox(label="⏱️ Time Taken (s)", interactive=False)
-
-    with gradio.Row():
-        with gradio.Column(scale=1):
-            media_output = gradio.Image(label="Current Image", interactive=False)
-            media_name_markdown = gradio.Markdown()
-            ui_e["retain_preview_checkbox"] = gradio.Checkbox(label="Retain preview on skip", value=True)
-        with gradio.Column(scale=1):
-            caption_output = gradio.Textbox(label="Generated Caption", interactive=False)
-
-    ui_e["start_button"].click(start_process, inputs=[], outputs=[ui_e[k] for k in control_keys])
-
-    ui_e["start_button"].click(
-        process_folder,
-        inputs=[
-            ui_e["folder_input"],
-            ui_e["prompt_input"],
-            ui_e["skip_existing_checkbox"],
-            ui_e["caption_extension"],
-            ui_e["max_tokens_slider"],
-            ui_e["retain_preview_checkbox"],
-            ui_e["resolution_mode"],
-            ui_e["batch_size_slider"],
-            ui_e["prefetch_workers_slider"],
-        ],
-        outputs=[
-            ui_e["status_output"],
-            media_output,
-            media_name_markdown,
-            caption_output,
-            progress_bar,
-            time_display,
-            *[ui_e[k] for k in control_keys],
-        ],
-    )
-
-    ui_e["abort_button"].click(
-        fn=abort_process,
-        inputs=[],
-        outputs=[ui_e[k] for k in control_keys],
-        queue=False,
-    )
-
-    ui_e["reset_button"].click(lambda: DEFAULT_PROMPT, inputs=[], outputs=[ui_e["prompt_input"]])
-    ui_e["start_button"].click(
-        get_model_info,
-        inputs=[],
-        outputs=[
-            model_name_display,
-            device_display,
-            vram_display,
-            dtype_display,
-            config_display,
-        ],
-    )
-
-    ui_e["load_button"].click(
-        _ui_load_model,
-        inputs=[model_dropdown, custom_model_box, quant_dropdown, attn_dropdown],
-        outputs=[
-            ui_e["status_output"],
-            model_name_display,
-            device_display,
-            vram_display,
-            dtype_display,
-            config_display,
-            ui_e["batch_size_slider"],
-        ],
-    )
-    gradio.Blocks.load(
-        iface,
-        get_model_info,
-        inputs=[],
-        outputs=[
-            model_name_display,
-            device_display,
-            vram_display,
-            dtype_display,
-            config_display,
-        ],
-    )
-
-
-iface.launch(
-    share=False,
-    theme=gradio.themes.Base(),
-    css="""
-.generating {
-    border: none;
-}
-""",
-)
+        _log_run_summary(completed_action, processed, skipped, failed, start)

@@ -4,17 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Single-file Gradio app (`app.py`) that batch-captions a folder of images/videos using Qwen VL models from Hugging Face. There is no library/package layer — everything (model loading, inference, UI wiring, generator handlers) lives in `app.py`.
+Batch-captions a folder of images/videos using Qwen VL models from Hugging Face. Split across three files:
+
+- **`captioner.py`** — library: model loading, inference helpers, the prefetch/batch pipeline, and the high-level `caption_folder()` generator that yields `SkipEvent` / `CaptionedEvent` / `ErrorEvent` / `CompleteEvent` / `AbortedEvent` dataclasses. Holds all module-level mutable state (`model`, `processor`, `current_model_id`, `current_quant`, `abort_event`).
+- **`app.py`** — Gradio UI. Imports from `captioner` and defines a thin `process_folder` generator that adapts events to Gradio update tuples (the `(status, media, name_md, caption, progress, elapsed, *control_updates)` shape). All UI-only state (`ui_e`, `control_keys`, the `toggle_controls` family, `_build_abort_yield`) lives here.
+- **`caption_cli.py`** — argparse CLI for headless runs (safe under nohup/tmux; doesn't die when a browser disconnects). Reuses `captioner.caption_folder()` directly; per-sample progress comes from `captioner`'s INFO logs.
 
 ## Commands
 
 This fork uses **uv** with a CUDA 13 PyTorch index (the upstream README still describes the older `pip install -r requirements.txt` flow against CUDA 12.8 — `pyproject.toml` is the source of truth for this fork).
 
 ```bash
-uv sync                 # install deps from pyproject.toml/uv.lock (resolves torch from pytorch-cu130 index)
-uv run python app.py    # launch the Gradio UI (also: ./run_app.sh once a venv is active)
-uv run ruff check .     # lint (config: line-length 120, selects C/E/F/I/W)
-uv run ruff format .    # format
+uv sync                                     # install deps from pyproject.toml/uv.lock (resolves torch from pytorch-cu130 index)
+uv run python app.py                        # launch the Gradio UI (also: ./run_app.sh once a venv is active)
+uv run python caption_cli.py FOLDER [...]   # headless CLI; --help for flags, --list-models for suggested ids
+uv run ruff check .                         # lint (config: line-length 120, selects C/E/F/I/W)
+uv run ruff format .                        # format
 ```
 
 There is no test suite.
@@ -23,7 +28,7 @@ There is no test suite.
 
 ### Module-level mutable state
 
-`model`, `processor`, `current_model_id`, `current_quant`, `should_abort`, and `ui_e` are module globals mutated by both UI callbacks and the inference generator. `unload_model()` / `load_selected_model()` rebind them; the inference helpers (`preprocess_batch`, `run_generate`, `decode_batch`) read them. Anything that touches model lifecycle must go through `load_selected_model()` so the fallback / cache-clear / left-padding configuration stays consistent. The model is **not** loaded at import — it loads lazily when the user clicks "Load / Reload Model" (or implicitly via UI start).
+`model`, `processor`, `current_model_id`, `current_quant`, and `abort_event` live in `captioner.py` and are shared by the Gradio UI handlers and the CLI (one loaded model per process). `ui_e` lives in `app.py` and is Gradio-only. `unload_model()` / `load_selected_model()` rebind the model/processor; the inference helpers (`preprocess_batch`, `run_generate`, `decode_batch`) read them. Anything that touches model lifecycle must go through `load_selected_model()` so the fallback / cache-clear / left-padding configuration stays consistent. The model is **not** loaded at import — it loads lazily when the user clicks "Load / Reload Model" in the UI, or up-front in the CLI before `caption_folder()` is called.
 
 ### Inference decomposition: preprocess / run / decode
 
@@ -37,20 +42,20 @@ The captioning code is split into pure stages so the prefetcher and batched gene
 
 ### Pipeline: dispatcher → ThreadPoolExecutor → consumer
 
-`process_folder` is the Gradio handler; the pipeline lives in three pieces:
+`captioner.caption_folder()` is the library entry point — a generator that owns the pipeline and yields `CaptionEvent` instances. Both `app.process_folder` (Gradio adapter) and `caption_cli.main` iterate it.
 
 1. **`_prefetch_dispatcher` (thread)** — walks `media_files` in order, groups runs of non-skipped files into batches of up to `batch_size`, and submits each batch as a `Future` to a `ThreadPoolExecutor` of `prefetch_workers` threads. Skip detection happens inline (no executor work). Pushes ordered tagged items onto a bounded `Queue`:
    - `("skip",  idx,     path,  None)`
    - `("batch", indices, paths, Future[BatchFeature])`
    - `None` end-of-stream sentinel
 2. **Executor pool** — preprocessing workers run `preprocess_batch` in parallel; the dispatcher's submit is non-blocking, queue back-pressure throttles work to in-flight ≈ `queue_size + workers`.
-3. **`_captioning_loop` (consumer, the Gradio generator's body)** — pulls items from the queue in submission order, awaits the Future, runs one `model.generate` per batch, decodes N captions, writes the `.txt` files, and yields one progress update **per sample within the batch** (so progress bar is still per-sample granular even with `batch_size > 1`).
+3. **Consumer (the body of `caption_folder`)** — pulls items from the queue in submission order; for `"skip"` items yields `SkipEvent` immediately, for `"batch"` items delegates to `_consume_batch_item` which awaits the Future, runs one `model.generate` per batch, decodes N captions, writes the caption files, and yields one event **per sample within the batch** (`CaptionedEvent` or `ErrorEvent`). The outer loop counts events to keep the run stats; the terminal `CompleteEvent` / `AbortedEvent` carries the totals.
 
-Per-sample console logging (`logger.info` with `[idx/total pct%] action path (elapsed MM:SS)`) lives in `_captioning_loop` for every event (skip / captioned / error). This is the authoritative progress source: `qwen_vl_utils.process_vision_info` chatters to stdout for Qwen models and JoyCaption's path stays silent, so without these explicit lines the console output looks model-dependent. Don't remove them when refactoring the loop.
+Per-sample console logging (`logger.info` with `[idx/total pct%] action path (elapsed MM:SS)`) is emitted by the library for every event (skip / captioned / error). This is the authoritative progress source: `qwen_vl_utils.process_vision_info` chatters to stdout for Qwen models and JoyCaption's path stays silent, so without these explicit lines the console output looks model-dependent. The CLI relies on these lines as its only progress output. Don't remove them when refactoring the loop.
 
-Run-summary line (`_log_run_summary`) is emitted from `_captioning_loop`'s `finally` block so it fires on every exit path: clean completion (`processing complete: ...`), abort (`processing aborted: ...`), or an unexpected exception (`processing interrupted: ...`). The active label is tracked via `completed_action`, set just before the matching `yield`/`return`. Always update `completed_action` if you add a new exit path.
+Run-summary line (`_log_run_summary`) is emitted from `caption_folder`'s `finally` block so it fires on every exit path: clean completion (`processing complete: ...`), abort (`processing aborted: ...`), or an unexpected exception (`processing interrupted: ...`). The active label is tracked via `completed_action`, set just before the matching terminal yield. Always update `completed_action` if you add a new exit path.
 
-Cleanup on abort/finish (`finally` in `process_folder`): set the `cancel` event, drain the queue (unblocks dispatcher's `put`), `executor.shutdown(wait=False, cancel_futures=True)` cancels queued-but-unstarted preprocess tasks while running ones finish naturally, then `dispatcher.join(timeout=2.0)`.
+Cleanup on abort/finish (`finally` in `caption_folder`): set the `cancel` event, drain the queue (unblocks dispatcher's `put`), `executor.shutdown(wait=False, cancel_futures=True)` cancels queued-but-unstarted preprocess tasks while running ones finish naturally, then `dispatcher.join(timeout=2.0)`.
 
 ### Left padding is required for batch generation
 
@@ -98,13 +103,13 @@ For Qwen3.5 models, `_build_messages()` appends a pre-seeded `{"role": "assistan
 
 ### `control_keys` and the generator yield contract
 
-`process_folder()` is a Gradio generator. Each `yield` produces `(status, media, name_md, caption, progress, elapsed_str, *control_updates)` — the 6 leading values map to specific output components, and `*control_updates` must be a list **in the exact order of `control_keys`** (see the `start_button.click(...)` `outputs=` list). When you add a new interactive UI element:
+`app.process_folder()` is the Gradio generator that adapts `caption_folder` events. Each `yield` produces `(status, media, name_md, caption, progress, elapsed_str, *control_updates)` — the 6 leading values map to specific output components, and `*control_updates` must be a list **in the exact order of `control_keys`** (see the `start_button.click(...)` `outputs=` list). When you add a new interactive UI element:
 
-1. Add it to `ui_e[...]` at construction time.
+1. Add it to `ui_e[...]` at construction time (in `app.py`).
 2. Add its key to `control_keys` (order matters — it's a positional contract).
 3. The `disable_controls_dict()` / `enable_controls_dict()` / `start_process()` / `finish_process()` / `abort_process()` helpers will pick it up automatically.
 
-Forgetting step 2 causes silent UI drift (wrong components get enabled/disabled).
+Forgetting step 2 causes silent UI drift (wrong components get enabled/disabled). The CLI is unaffected — it never touches these helpers, only the library's event stream.
 
 ### Resolution mode → processor kwargs
 
@@ -112,7 +117,9 @@ Forgetting step 2 causes silent UI drift (wrong components get enabled/disabled)
 
 ### Abort flow
 
-`should_abort` is checked at the top of each `_captioning_loop` iteration **and** at the top of each `_prefetch_dispatcher` iteration, then reset to `False` on consumption by the consumer. The abort button has `queue=False` so it bypasses Gradio's queue and flips the flag immediately even while a generation is in-flight; the in-flight `model.generate()` call still runs to completion — abort takes effect on the *next* batch. The producer-side `cancel` `threading.Event` is a separate signal used only for thread cleanup in the `finally` block.
+`captioner.abort_event` (a `threading.Event`) is the user-facing cancellation signal. Both the Gradio abort button (`app.abort_process`) and the CLI's SIGINT handler call `captioner.request_abort()` which sets it. The flag is checked at the top of each consumer iteration in `caption_folder` **and** at the top of each `_prefetch_dispatcher` iteration. `caption_folder` clears the event at the start of every run, so a leftover abort from a previous Gradio session doesn't poison the next one. The abort button has `queue=False` so it bypasses Gradio's queue and flips the flag immediately even while a generation is in-flight; the in-flight `model.generate()` call still runs to completion — abort takes effect on the *next* batch, which then yields an `AbortedEvent`. The producer-side `cancel` `threading.Event` is a separate, internal signal used only for thread cleanup in the `finally` block.
+
+In the CLI, a second Ctrl+C raises `SystemExit(130)` for force-exit — useful if `model.generate()` is genuinely stuck and the cooperative path won't return.
 
 ### Batch size suggestion
 
@@ -120,7 +127,7 @@ Forgetting step 2 causes silent UI drift (wrong components get enabled/disabled)
 
 ### Output convention
 
-For each input file `foo.jpg`, the caption is written as `foo.<ext>` next to it (via `_caption_path_for`). The extension is taken from the **Caption File Extension** UI textbox (default `txt`); the user enters it without the leading dot, and `_sanitize_caption_extension()` strips stray dots/whitespace and falls back to `txt` if empty. `skip_existing` checks for the file at that exact extension before invoking the model — switching extensions effectively re-captions everything because the old `.txt` files no longer count as "already captioned". Subfolders are walked recursively via `os.walk`.
+For each input file `foo.jpg`, the caption is written as `foo.<ext>` next to it (via `captioner.caption_path_for`). The extension is taken from the **Caption File Extension** UI textbox / `--caption-extension` CLI flag (default `txt`); the user enters it without the leading dot, and `captioner.sanitize_caption_extension()` strips stray dots/whitespace and falls back to `txt` if empty. `skip_existing` checks for the file at that exact extension before invoking the model — switching extensions effectively re-captions everything because the old `.txt` files no longer count as "already captioned". Subfolders are walked recursively via `Path.rglob`.
 
 ## Style
 

@@ -1,9 +1,6 @@
-[build-backend]
-requires = ["uv_build~=0.11.8"]
-
 [project]
 name = "simple-captioner"
-version = "0.0.1"
+version = "3.0.0"
 dependencies = [
 	"gradio>=6.14.0",
 	"Pillow>=11.2.1",
@@ -27,6 +24,16 @@ flash4 = [
 	"flash-attn-4[cu13]",
 ]
 
+[project.scripts]
+simple-captioner = "simple_captioner.cli:main"
+
+[project.gui-scripts]
+gsimple-captioner = "simple_captioner.app:main"
+
+[build-system]
+requires = ["uv_build>=0.11.3,<0.12.0"]
+build-backend = "uv_build"
+
 [tool.ruff]
 line-length = 120
 show-fixes = true
@@ -41,7 +48,6 @@ build-constraint-dependencies = [
 	"pip",
 	"setuptools==80.10.2",
 ]
-
 
 [tool.uv.extra-build-dependencies]
 flash-attn = ["torch"]

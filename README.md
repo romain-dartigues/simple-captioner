@@ -15,10 +15,13 @@ This fork add:
 # useful environment variables:
 export HF_HUB_OFFLINE=1 GRADIO_SERVER_NAME="0.0.0.0"
 
-uv run python app.py
+uv run gsimple-captioner
 
 # try another Python version with an optional dependency
-uv run --extra flash4 --with scalene --python 3.10 python app.py
+uv run --extra flash4 --with scalene --python 3.10 gsimple-captioner
+
+# Gradio is nice, but I like the CLI
+uv run simple-captioner -h
 ```
 
 ## This works for me™
